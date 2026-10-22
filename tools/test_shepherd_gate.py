@@ -6,12 +6,19 @@ on. If the kill-switch matrix, the dup planner, the conflict classifier, or
 the probe parser drift, CI fails before any workflow can.
 """
 
+import io
+import json
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import autoland as al  # noqa: E402
 import shepherd as sh  # noqa: E402
 
 
@@ -115,6 +122,173 @@ class ProbeParser(unittest.TestCase):
         added = list(sh.added_lines(self.DIFF))
         self.assertTrue(any(re.search(rule["pattern"], ln) for ln in added))
         self.assertFalse(any("removed line" in ln for ln in added))
+
+
+class AutolandBundleTests(unittest.TestCase):
+    """run_bundle() pre-validates repro.hy + fix.patch before building and
+    always calls revert_on_failure() from its post-apply finally block."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="autoland-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.queue = Path(self.tmp.name) / "land-queue"
+        self.queue.mkdir()
+        self.slug = "issue-1125-sample"
+        self.bundle = self.queue / self.slug
+        self.bundle.mkdir()
+        (self.bundle / "meta.json").write_text(
+            json.dumps({"issue": 1125, "expected_code": "HYB-E1000"}),
+            encoding="utf-8",
+        )
+
+    def test_missing_repro_returns_no_bundle_before_build(self):
+        (self.bundle / "fix.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+        for live in (False, True):
+            with self.subTest(live=live), \
+                 mock.patch.object(al, "QUEUE", self.queue), \
+                 mock.patch.object(al, "build") as m_build, \
+                 mock.patch.object(al, "check_repro") as m_check:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = al.run_bundle(self.slug, live=live, token_env="GITHUB_TOKEN")
+                self.assertEqual(rc, 2)
+                self.assertIn("AUTOLAND-NO-BUNDLE", buf.getvalue())
+                self.assertIn("missing repro.hy or fix.patch", buf.getvalue())
+                m_build.assert_not_called()
+                m_check.assert_not_called()
+
+    def test_missing_fix_patch_returns_no_bundle_even_in_dry_run(self):
+        (self.bundle / "repro.hy").write_text("fn main() {}\n", encoding="utf-8")
+        for live in (False, True):
+            with self.subTest(live=live), \
+                 mock.patch.object(al, "QUEUE", self.queue), \
+                 mock.patch.object(al, "build") as m_build, \
+                 mock.patch.object(al, "check_repro") as m_check:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = al.run_bundle(self.slug, live=live, token_env="GITHUB_TOKEN")
+                self.assertEqual(rc, 2)
+                self.assertIn("AUTOLAND-NO-BUNDLE", buf.getvalue())
+                self.assertIn("missing repro.hy or fix.patch", buf.getvalue())
+                m_build.assert_not_called()
+                m_check.assert_not_called()
+
+    def test_complete_bundle_dry_run_succeeds_after_baseline_accept(self):
+        (self.bundle / "repro.hy").write_text("fn main() {}\n", encoding="utf-8")
+        (self.bundle / "fix.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+        with mock.patch.object(al, "QUEUE", self.queue), \
+             mock.patch.object(al, "build") as m_build, \
+             mock.patch.object(al, "check_repro", return_value=(0, "")) as m_check:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = al.run_bundle(self.slug, live=False, token_env="GITHUB_TOKEN")
+            self.assertEqual(rc, 0)
+            self.assertIn("AUTOLAND-DRYRUN", buf.getvalue())
+            m_build.assert_called_once_with()
+            m_check.assert_called_once_with(f"automation/land-queue/{self.slug}/repro.hy")
+
+    def test_empty_or_invalid_bundle_artifacts_return_no_bundle_before_build(self):
+        scenarios = [
+            ("empty-repro", "", "diff --git a/x b/x\n", {"issue": 1125}),
+            ("empty-patch", "fn main() {}\n", "", {"issue": 1125}),
+            ("missing-issue", "fn main() {}\n", "diff --git a/x b/x\n", {"expected_code": "HYB-E1000"}),
+            ("dir-repro", None, "diff --git a/x b/x\n", {"issue": 1125}),
+        ]
+        for label, repro_txt, patch_txt, meta_obj in scenarios:
+            slug = f"case-{label}"
+            bdir = self.queue / slug
+            bdir.mkdir()
+            (bdir / "meta.json").write_text(json.dumps(meta_obj), encoding="utf-8")
+            if repro_txt is None:
+                (bdir / "repro.hy").mkdir()
+            else:
+                (bdir / "repro.hy").write_text(repro_txt, encoding="utf-8")
+            (bdir / "fix.patch").write_text(patch_txt, encoding="utf-8")
+            with self.subTest(case=label), \
+                 mock.patch.object(al, "QUEUE", self.queue), \
+                 mock.patch.object(al, "build") as m_build, \
+                 mock.patch.object(al, "check_repro") as m_check:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = al.run_bundle(slug, live=True, token_env="GITHUB_TOKEN")
+                self.assertEqual(rc, 2)
+                self.assertIn("AUTOLAND-NO-BUNDLE", buf.getvalue())
+                m_build.assert_not_called()
+                m_check.assert_not_called()
+
+    def test_already_landed_bundle_skips_without_requiring_repro_or_patch(self):
+        (self.bundle / "meta.json").write_text(
+            json.dumps({"issue": 1125, "status": "landed", "landedSha": "deadbeef1234"}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(al, "QUEUE", self.queue), \
+             mock.patch.object(al, "build") as m_build:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = al.run_bundle(self.slug, live=True, token_env="GITHUB_TOKEN")
+            self.assertEqual(rc, 0)
+            self.assertIn("AUTOLAND-SKIP", buf.getvalue())
+            m_build.assert_not_called()
+
+    def test_post_apply_failures_and_exceptions_always_revert_dirty_tree(self):
+        (self.bundle / "repro.hy").write_text("fn main() {}\n", encoding="utf-8")
+        (self.bundle / "fix.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+        corpus_dir = Path(self.tmp.name) / "tests" / "checker-corpus"
+        corpus_dir.mkdir(parents=True)
+        repro_dst = corpus_dir / f"_autoland_{self.slug}.hy"
+        apply_ok = subprocess.CompletedProcess(["git", "apply"], 0, "", "")
+
+        repro_dst.write_text("fn main() {}\n", encoding="utf-8")
+        with mock.patch.object(al, "ROOT", Path(self.tmp.name)), \
+             mock.patch.object(al, "QUEUE", self.queue), \
+             mock.patch.object(al, "sh", return_value=apply_ok), \
+             mock.patch.object(al, "log_event"), \
+             mock.patch.object(al, "build", side_effect=[None, RuntimeError("build boom")]), \
+             mock.patch.object(al, "check_repro", return_value=(0, "")), \
+             mock.patch.object(al, "revert_on_failure") as m_revert:
+            with self.assertRaises(RuntimeError):
+                al.run_bundle(self.slug, live=True, token_env="GITHUB_TOKEN")
+            m_revert.assert_called_once_with()
+            self.assertFalse(repro_dst.exists())
+
+        repro_dst.write_text("fn main() {}\n", encoding="utf-8")
+        with mock.patch.object(al, "ROOT", Path(self.tmp.name)), \
+             mock.patch.object(al, "QUEUE", self.queue), \
+             mock.patch.object(al, "sh", return_value=apply_ok), \
+             mock.patch.object(al, "log_event"), \
+             mock.patch.object(al, "build"), \
+             mock.patch.object(al, "check_repro", side_effect=[(0, ""), (1, "error[HYB-E1000]")]), \
+             mock.patch.object(al, "battery", return_value=[("workspace", True, "")]), \
+             mock.patch.object(al, "land_commit", side_effect=RuntimeError("push failed")), \
+             mock.patch.object(al, "revert_on_failure") as m_revert:
+            with self.assertRaises(RuntimeError):
+                al.run_bundle(self.slug, live=True, token_env="GITHUB_TOKEN")
+            m_revert.assert_called_once_with()
+            self.assertFalse(repro_dst.exists())
+
+        cases = [
+            ("ineffective", [(0, ""), (0, "")], [], 5),
+            ("wrong-code", [(0, ""), (1, "error[HYB-E9999]")], [], 6),
+            ("battery-failed", [(0, ""), (1, "error[HYB-E1000]")],
+             [("workspace", False, "1 failed")], 7),
+        ]
+        for label, repro_results, bat_results, expected_rc in cases:
+            repro_dst.write_text("fn main() {}\n", encoding="utf-8")
+            with self.subTest(case=label), \
+                 mock.patch.object(al, "ROOT", Path(self.tmp.name)), \
+                 mock.patch.object(al, "QUEUE", self.queue), \
+                 mock.patch.object(al, "sh", return_value=apply_ok), \
+                 mock.patch.object(al, "log_event"), \
+                 mock.patch.object(al, "build"), \
+                 mock.patch.object(al, "check_repro", side_effect=repro_results), \
+                 mock.patch.object(al, "battery", return_value=bat_results), \
+                 mock.patch.object(al, "revert_on_failure") as m_revert:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = al.run_bundle(self.slug, live=True, token_env="GITHUB_TOKEN")
+                self.assertEqual(rc, expected_rc)
+                m_revert.assert_called_once_with()
+                self.assertFalse(repro_dst.exists())
 
 
 if __name__ == "__main__":

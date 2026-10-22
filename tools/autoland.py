@@ -148,16 +148,29 @@ def log_event(token_env: str, event: str, verdict: str, note: str, issue: int | 
 
 def run_bundle(slug: str, live: bool, token_env: str) -> int:
     d = QUEUE / slug
-    if not (d / "meta.json").is_file():
+    meta_src = d / "meta.json"
+    if not meta_src.is_file() or meta_src.stat().st_size == 0:
         return die("NO-BUNDLE", slug, "missing meta.json", 2)
     meta = read_meta(d)
+    if not isinstance(meta, dict):
+        return die("NO-BUNDLE", slug, "invalid meta.json", 2)
     if meta.get("status") == "landed":
         print(f"AUTOLAND-SKIP: {slug} already landed at {meta.get('landedSha', '?')[:9]}")
         return 0
     issue = meta.get("issue")
     expected = meta.get("expected_code", "")
     repro_src = d / "repro.hy"
+    patch_src = d / "fix.patch"
+    if (
+        not issue
+        or not repro_src.is_file()
+        or not patch_src.is_file()
+        or repro_src.stat().st_size == 0
+        or patch_src.stat().st_size == 0
+    ):
+        return die("NO-BUNDLE", slug, "missing repro.hy or fix.patch", 2)
     repro_rel = f"automation/land-queue/{slug}/repro.hy"
+    repro_dst = ROOT / "tests" / "checker-corpus" / f"_autoland_{slug}.hy"
 
     # ---- 1. BASELINE: the unpatched tree must ACCEPT the repro ----
     build()
@@ -176,6 +189,7 @@ def run_bundle(slug: str, live: bool, token_env: str) -> int:
     if r.returncode != 0:
         log_event(token_env, "autoland", "blocked", f"#{issue}: fix.patch does not apply on main tip", issue, live=live)
         return die("APPLY-FAILED", slug, f"git apply failed: {r.stderr[-400:]}", 4)
+    landed = False
     try:
         build()
         code, out = check_repro(repro_rel)
@@ -206,11 +220,14 @@ def run_bundle(slug: str, live: bool, token_env: str) -> int:
         log_event(token_env, "autoland", "landed",
                   f"#{issue}: bundle '{slug}' landed {sha[:9]} — baseline ACCEPT, patched REJECT {expected}, battery green, LAND-CONFIRMED", issue, live=live)
         print(f"AUTOLAND-LANDED: {slug} — {sha[:9]} LAND-CONFIRMED (Fixes #{issue})")
+        landed = True
         return 0
     finally:
         # If anything above raised, leave main clean (the landing path
         # pushed already; a failure path must not leave the tree dirty).
-        pass
+        repro_dst.unlink(missing_ok=True)
+        if not landed:
+            revert_on_failure()
 
 
 def revert_on_failure() -> None:
