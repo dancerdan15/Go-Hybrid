@@ -624,34 +624,53 @@ impl<'a> Checker<'a> {
         // `[]byte("abc")` — a slice type-as-value called with one argument
         // (the standing type-as-value encoding; see hy-emit's conversion
         // branch for the emission half of issue #228).
+        let bare_callee = unwrap_parens(callee);
         if let Expr::SliceLit {
             elem: Some(t),
             items,
             ..
-        } = callee
+        } = bare_callee
         {
-            if items.is_empty() && callee.as_array_lit().is_none() {
+            if items.is_empty() && bare_callee.as_array_lit().is_none() {
                 self.check_slice_conversion(t, arg, span);
                 return;
             }
         }
-        let Expr::Ident { name, .. } = callee else {
+        let Expr::Ident { name, .. } = unwrap_parens(callee) else {
             return;
         };
-        if !is_conversion_target(name) {
+        // Issue #823: type-aliased targets convert exactly like their
+        // resolution — `my_int("abc")` is `int("abc")`; a slice alias
+        // routes to the slice-conversion check with the resolved element.
+        let resolved = self.resolve_type_alias(&TypeExpr::Named {
+            name: name.clone(),
+            span: callee.span(),
+        });
+        let target_name: String = match &resolved {
+            TypeExpr::Named { name: rn, .. } => rn.clone(),
+            TypeExpr::Slice { elem: el, .. } => {
+                self.check_slice_conversion(el, arg, span);
+                return;
+            }
+            _ => return,
+        };
+        if !is_conversion_target(&target_name) {
             return;
         }
-        let Some(c) = conv_const(arg) else {
+        let Some(c) = conv_const_with(arg, &self.const_values, 0) else {
             return; // non-constant operand: run-time conversion (SPEC X4)
         };
-        self.check_conv_against_target(name, &c, arg, span);
+        self.check_conv_against_target(&target_name, &c, arg, span);
     }
 
     fn check_slice_conversion(&mut self, elem: &TypeExpr, arg: &Expr, span: Span) {
-        let TypeExpr::Named { name: slice_elem, .. } = elem else {
+        // Issue #823: resolve type aliases on the element — `[]my_elem`
+        // converts exactly like its resolution.
+        let resolved_elem = self.resolve_type_alias(elem);
+        let TypeExpr::Named { name: slice_elem, .. } = &resolved_elem else {
             return; // []T with a non-named element + a run-time operand
         };
-        match conv_const(arg) {
+        match conv_const_with(arg, &self.const_values, 0) {
             Some(ConvConst::Str) => {
                 // Go allows string -> []byte / []rune (and their aliases)
                 // only; every other element type is a compile error.
@@ -698,11 +717,27 @@ impl<'a> Checker<'a> {
     }
 
     fn check_conv_against_target(&mut self, target: &str, c: &ConvConst, arg: &Expr, span: Span) {
+        // Issue #823: Go accepts only the identity `bool(true)`; every
+        // other constant operand is `cannot convert ... to type bool`.
+        if target == "bool" {
+            if !matches!(c, ConvConst::Bool) {
+                self.emit_conv_kind_error(target, c, arg, span);
+            }
+            return;
+        }
         if let Some((lo, hi)) = fixed_width_int_range(target) {
             match c {
                 ConvConst::Int(v) => {
                     if *v < lo || *v > hi {
-                        if is_64bit_int_target(target) {
+                        // Issue #823: the emitter's SPEC X4 fold rewrites
+                        // LITERAL operands only (`u8(300)` -> `uint8(44)`).
+                        // A constant folded from a named const stays an
+                        // identifier in the emitted Go, where Go itself
+                        // rejects the overflow — only literals enjoy the
+                        // sub-64 skip.
+                        let literal_operand =
+                            matches!(unwrap_parens(arg), Expr::Lit { .. });
+                        if is_64bit_int_target(target) || !literal_operand {
                             // 64-bit targets skip the emitter's X4 fold —
                             // nothing rewrites this, Go rejects it outright.
                             self.emit_const_conversion_error(
@@ -945,6 +980,77 @@ impl ConvConst {
     }
 }
 
+/// Issue #823: `conv_const` made const-map-aware — file-level `const`
+/// identifiers resolve to their initializers (#998 pattern) and constant
+/// binary expressions fold: int arithmetic via the shared `fold_bin`
+/// (#725 machinery), float via f64, string concat, comparisons to untyped
+/// bool constants (Go folds `1 < 2` at compile time). Block-scoped consts
+/// stay fail-open (FnState carries no const-value map — #998 precedent).
+fn conv_const_with(
+    e: &Expr,
+    consts: &std::collections::HashMap<String, &Expr>,
+    depth: u32,
+) -> Option<ConvConst> {
+    if depth > 16 {
+        return None;
+    }
+    let bare = unwrap_parens(e);
+    match bare {
+        Expr::Ident { name, .. } => {
+            let v = consts.get(name.as_str())?;
+            conv_const_with(v, consts, depth + 1)
+        }
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let l = conv_const_with(lhs, consts, depth + 1)?;
+            let r = conv_const_with(rhs, consts, depth + 1)?;
+            if matches!(
+                op,
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+            ) {
+                // a comparison of constants is an untyped bool constant;
+                // the VALUE never matters — targets reject the Bool kind
+                // (identity on `bool` was decided before the fold).
+                let _ = (conv_as_float(&l), conv_as_float(&r));
+                return Some(ConvConst::Bool);
+            }
+            match (l, r) {
+                (ConvConst::Str, ConvConst::Str) if matches!(op, BinOp::Add) => {
+                    Some(ConvConst::Str)
+                }
+                (ConvConst::Bool, ConvConst::Bool)
+                    if matches!(op, BinOp::And | BinOp::Or) =>
+                {
+                    Some(ConvConst::Bool)
+                }
+                (a, b) => {
+                    let fa = conv_as_float(&a)?;
+                    let fb = conv_as_float(&b)?;
+                    match op {
+                        BinOp::Add => Some(ConvConst::Float(fa + fb)),
+                        BinOp::Sub => Some(ConvConst::Float(fa - fb)),
+                        BinOp::Mul => Some(ConvConst::Float(fa * fb)),
+                        BinOp::Div => Some(ConvConst::Float(fa / fb)),
+                        _ => None,
+                    }
+                }
+            }
+        }
+        _ => conv_const(bare),
+    }
+}
+
+/// Best f64 reading of a folded constant for float arithmetic and
+/// comparisons; non-numeric kinds (Str/Bool/Nil) are None.
+fn conv_as_float(c: &ConvConst) -> Option<f64> {
+    match c {
+        ConvConst::Int(v) => Some(*v as f64),
+        ConvConst::Float(f) => Some(*f),
+        ConvConst::Char(v) => Some(*v as f64),
+        ConvConst::Huge { f, .. } => Some(*f),
+        ConvConst::Str | ConvConst::Bool | ConvConst::Nil => None,
+    }
+}
+
 fn conv_const(e: &Expr) -> Option<ConvConst> {
     match unwrap_parens(e) {
         Expr::Lit { kind, .. } => Some(match kind {
@@ -1028,9 +1134,11 @@ fn huge_int_as_f64(s: &str) -> f64 {
 }
 
 /// True when `name` is a built-in conversion target of `Type(const)` calls.
+/// Issue #823: `bool` joins — the emitter emits `bool(...)` and Go accepts
+/// only the identity `bool(true)`.
 fn is_conversion_target(name: &str) -> bool {
     fixed_width_int_range(name).is_some()
-        || matches!(name, "f32" | "f64" | "float32" | "float64" | "string")
+        || matches!(name, "f32" | "f64" | "float32" | "float64" | "string" | "bool")
 }
 
 /// Targets the emitter's SPEC X4 fold skips (`bits >= 64`) — constants here

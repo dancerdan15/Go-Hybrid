@@ -294,6 +294,10 @@ fn build_tables(ck: &mut Checker<'_>) {
                 ck.check_expr_emit_guard(&FnState::default(), &c.value);
                 ck.check_composite_nils(&FnState::default(), &c.value);
                 ck.check_expr_builtin_args(&c.value);
+                // Issue #823 gap 5: file-level const initializers go through
+                // the SAME conversion guard as statement expressions —
+                // `const a = int(2.5)` must reject like `x := int(2.5)`.
+                ck.check_expr_type_conversions(&c.value);
                 let b = ck.const_binding(c);
                 ck.consts.insert(c.name.clone(), b);
                 ck.check_const_init_is_constant(&c.name, &c.value, None);

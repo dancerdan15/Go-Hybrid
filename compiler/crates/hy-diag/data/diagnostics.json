@@ -624,6 +624,7 @@
     },
     {
       "code": "HYB-E6006",
+      "tier0_rule_id": "BUILDABLE",
       "name": "invalid-const-conversion",
       "category": "overflow-bounds",
       "severity": "error",
