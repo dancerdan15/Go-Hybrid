@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -171,6 +172,19 @@ def age_days(iso, now):
     return round((now - datetime.fromisoformat(iso.replace("Z", "+00:00"))).total_seconds() / 86400, 1)
 
 
+TEST_PATTERNS = ("tests/", "/corpus", "_accept.hy", "_reject.hy",
+                 "_test.go", "_test.rs", "test_")
+
+
+def has_test_file(paths):
+    if isinstance(paths, str):
+        paths = (paths,)
+    return any(
+        any(t in str(p).replace("\\", "/") for t in TEST_PATTERNS)
+        for p in (paths or ()) if p
+    )
+
+
 # ---------------------------------------------------------------- scan
 
 def collect(cfg, gh, args):
@@ -184,25 +198,68 @@ def collect(cfg, gh, args):
     # the actionable rebase window; a PR 600 commits behind is a stale-base
     # close-candidate regardless of overlap.
     overlap_window = 100
+    mb_cache, mb_locks, mb_guard = {}, {}, threading.Lock()
+
+    def main_since(sha):
+        with mb_guard:
+            if sha in mb_cache:
+                return mb_cache[sha]
+            lock = mb_locks.setdefault(sha, threading.Lock())
+        with lock:
+            with mb_guard:
+                if sha in mb_cache:
+                    return mb_cache[sha]
+            cmp2 = gh.get("/repos/%s/compare/%s...%s?per_page=250" % (gh.repo, sha, main_sha)) or {}
+            info = {
+                "status": cmp2.get("status"),
+                "ahead_by": cmp2.get("ahead_by", 0) or 0,
+                "behind_by": cmp2.get("behind_by", 0) or 0,
+                "merge_base": (cmp2.get("merge_base_commit") or {}).get("sha"),
+                "paths": frozenset(
+                    f["filename"] for f in (cmp2.get("files") or [])
+                    if isinstance(f, dict) and "filename" in f
+                ),
+            }
+            with mb_guard:
+                mb_cache[sha] = info
+                return info
 
     def one(pr):
         n = pr["number"]
-        full = gh.get("/repos/%s/pulls/%d" % (gh.repo, n))
-        files = gh.paginate("/repos/%s/pulls/%d/files?per_page=100" % (gh.repo, n))
-        paths = [f["filename"] for f in files]
+        full = gh.get("/repos/%s/pulls/%d" % (gh.repo, n)) or {}
+        files = gh.paginate("/repos/%s/pulls/%d/files?per_page=100" % (gh.repo, n)) or []
+        paths = [f["filename"] for f in files if isinstance(f, dict) and "filename" in f]
         pset = set(paths)
-        adds = sum(f.get("additions", 0) or 0 for f in files)
-        dels = sum(f.get("deletions", 0) or 0 for f in files)
+        adds = sum(f.get("additions", 0) or 0 for f in files if isinstance(f, dict))
+        dels = sum(f.get("deletions", 0) or 0 for f in files if isinstance(f, dict))
 
-        behind_by, overlap_paths, merge_base = 0, set(), None
-        cmp1 = gh.get("/repos/%s/compare/%s...%s" % (gh.repo, main_sha, pr["head"]["sha"]))
-        if cmp1:
-            behind_by = cmp1.get("behind_by", 0) or 0
-            merge_base = (cmp1.get("merge_base_commit") or {}).get("sha")
-            if 0 < behind_by <= overlap_window and merge_base:
-                cmp2 = gh.get("/repos/%s/compare/%s...%s?per_page=250" % (gh.repo, merge_base, main_sha))
-                main_paths = {f["filename"] for f in (cmp2 or {}).get("files", [])}
-                overlap_paths = pset & main_paths
+        behind_by, overlap_paths, merge_base = 0, set(), main_sha
+        head_sha = (pr.get("head") or {}).get("sha") or (full.get("head") or {}).get("sha") or ""
+        base_sha = (full.get("base") or {}).get("sha") or (pr.get("base") or {}).get("sha") or ""
+        if base_sha != main_sha and head_sha != main_sha:
+            base_info = main_since(base_sha) if base_sha else None
+            if base_info and base_info["status"] != "diverged" and base_info["ahead_by"] > 0:
+                behind_by = base_info["ahead_by"]
+                merge_base = base_sha
+                if behind_by <= overlap_window:
+                    overlap_paths = pset & base_info["paths"]
+            elif base_info and base_info["merge_base"] and base_info["merge_base"] not in (base_sha, main_sha):
+                merge_base = base_info["merge_base"]
+                mb_info = main_since(merge_base)
+                behind_by = mb_info["ahead_by"]
+                if 0 < behind_by <= overlap_window:
+                    overlap_paths = pset & mb_info["paths"]
+            else:
+                cmp1 = gh.get("/repos/%s/compare/%s...%s" % (gh.repo, main_sha, head_sha)) if head_sha else None
+                if cmp1:
+                    behind_by = cmp1.get("behind_by", 0) or 0
+                    merge_base = (cmp1.get("merge_base_commit") or {}).get("sha")
+                    if merge_base and merge_base != main_sha and (not behind_by or behind_by <= overlap_window):
+                        mb_info = main_since(merge_base)
+                        if not behind_by:
+                            behind_by = mb_info["ahead_by"]
+                        if 0 < behind_by <= overlap_window:
+                            overlap_paths = pset & mb_info["paths"]
         return {
             "number": n,
             "title": pr["title"][:90],
@@ -214,16 +271,14 @@ def collect(cfg, gh, args):
             "draft": bool(pr.get("draft")),
             "mergeable": full.get("mergeable"),
             "mergeable_state": full.get("mergeable_state"),
-            "head_sha": pr["head"]["sha"][:12],
+            "head_sha": head_sha[:12],
             "files": len(paths),
             "paths_sample": sorted(paths)[:12],
             "additions": adds,
             "deletions": dels,
             "behind_by": behind_by,
             "overlap_risk": sorted(overlap_paths)[:8],
-            "tests_included": any(
-                "tests/" in p or "/corpus" in p or p.endswith("_reject.hy") or p.endswith("_accept.hy")
-                for p in paths),
+            "tests_included": has_test_file(paths),
         }
 
     items = []
