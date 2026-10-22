@@ -420,8 +420,17 @@ impl FnState {
                 }
             }
         }
-        // Preserve may-share relationships established inside the block between
-        // outer bindings (including through self-shadowed outer bindings).
+        // Preserve may-share relationships and alias links established inside
+        // the block between surviving outer bindings.
+        let mut new_outer_aliases: Vec<(String, String)> = Vec::new();
+        for (a, target) in &self.aliases {
+            if survives_as_outer(a, &self.aliases, &self.env, &self.scopes) {
+                let root = crate::freeze::resolve_alias(self, target);
+                if survives_as_outer(&root, &self.aliases, &self.env, &self.scopes) && a != &root {
+                    new_outer_aliases.push((a.clone(), root));
+                }
+            }
+        }
         let mut inner_outer_shares: Vec<(String, String)> = Vec::new();
         for a in self.may_share.keys() {
             let Some(oa) = to_outer_name(a, &self.aliases, &self.env, &self.scopes) else {
@@ -430,6 +439,16 @@ impl FnState {
             for b in self.share_group(a) {
                 if let Some(ob) = to_outer_name(&b, &self.aliases, &self.env, &self.scopes) {
                     inner_outer_shares.push((oa.clone(), ob));
+                }
+            }
+        }
+        for (peer, targets) in &self.shadow_links {
+            if survives_as_outer(peer, &self.aliases, &self.env, &self.scopes) {
+                for (orig, depth) in targets {
+                    if *depth < self.scopes.len() && peer != orig {
+                        inner_outer_shares.push((peer.clone(), orig.clone()));
+                        new_outer_aliases.push((peer.clone(), orig.clone()));
+                    }
                 }
             }
         }
@@ -443,6 +462,13 @@ impl FnState {
                 self.may_share = outer_share;
                 for (a, b) in inner_outer_shares {
                     self.share_edge(&a, &b);
+                }
+            }
+            for (a, root) in new_outer_aliases {
+                if !self.aliases.contains_key(&a) && crate::freeze::resolve_alias(self, &root) != a {
+                    self.aliases.insert(a, root);
+                } else {
+                    self.share_edge(&a, &root);
                 }
             }
             for (oa, orig) in inner_outer_origins {

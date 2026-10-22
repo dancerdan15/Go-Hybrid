@@ -747,7 +747,16 @@ impl<'a> Checker<'a> {
                 }
                 let seeded = clear_names.clone();
                 for m in seeded {
-                    clear_names.extend(iter_st.share_group(&m));
+                    for peer in iter_st.share_group(&m) {
+                        clear_names.push(peer.clone());
+                        let proot = resolve_alias(&iter_st, &peer);
+                        clear_names.push(proot.clone());
+                        for a in iter_st.aliases.keys() {
+                            if resolve_alias(&iter_st, a) == proot {
+                                clear_names.push(a.clone());
+                            }
+                        }
+                    }
                 }
                 for k in &clear_names {
                     if let Some(b) = iter_st.env_lookup_mut(k) {

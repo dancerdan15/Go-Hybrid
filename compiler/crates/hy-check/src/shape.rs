@@ -25,32 +25,34 @@ impl<'a> Checker<'a> {
         self.shape_of_type_depth(ty, 0)
     }
 
+    pub(crate) fn shape_of_type_with_params(&self, ty: &TypeExpr, tp: &std::collections::HashMap<String, TypeShape>) -> TypeShape {
+        self.shape_of_type_depth_with_params(ty, 0, tp)
+    }
+
     fn shape_of_type_depth(&self, ty: &TypeExpr, depth: usize) -> TypeShape {
+        self.shape_of_type_depth_with_params(ty, depth, &std::collections::HashMap::new())
+    }
+
+    fn shape_of_type_depth_with_params(&self, ty: &TypeExpr, depth: usize, type_params: &std::collections::HashMap<String, TypeShape>) -> TypeShape {
         if depth > Self::MAX_TYPE_RESOLUTION_DEPTH {
             return TypeShape::Unknown;
         }
         match ty {
-            TypeExpr::Named { name, .. } => self.named_shape_depth(name, depth),
-            TypeExpr::Pointer { to, .. } => {
-                TypeShape::Pointer(Box::new(self.shape_of_type_depth(to, depth + 1)))
-            }
-            TypeExpr::Slice { elem, .. } => {
-                TypeShape::Slice(Box::new(self.shape_of_type_depth(elem, depth + 1)))
-            }
-            TypeExpr::Array { elem, .. } => {
-                TypeShape::Array(Box::new(self.shape_of_type_depth(elem, depth + 1)))
-            }
+            TypeExpr::Named { name, .. } => type_params.get(name.as_str()).cloned().unwrap_or_else(|| self.named_shape_depth(name, depth)),
+            TypeExpr::Pointer { to, .. } => TypeShape::Pointer(Box::new(self.shape_of_type_depth_with_params(to, depth + 1, type_params))),
+            TypeExpr::Slice { elem, .. } => TypeShape::Slice(Box::new(self.shape_of_type_depth_with_params(elem, depth + 1, type_params))),
+            TypeExpr::Array { elem, .. } => TypeShape::Array(Box::new(self.shape_of_type_depth_with_params(elem, depth + 1, type_params))),
             TypeExpr::Map { key, value, .. } => TypeShape::Map(
-                Box::new(self.shape_of_type_depth(key, depth + 1)),
-                Box::new(self.shape_of_type_depth(value, depth + 1)),
+                Box::new(self.shape_of_type_depth_with_params(key, depth + 1, type_params)),
+                Box::new(self.shape_of_type_depth_with_params(value, depth + 1, type_params)),
             ),
             TypeExpr::Chan { elem, .. } => {
-                TypeShape::Chan(Box::new(self.shape_of_type_depth(elem, depth + 1)))
+                TypeShape::Chan(Box::new(self.shape_of_type_depth_with_params(elem, depth + 1, type_params)))
             }
             // option[T] carries T by value in a struct { v T; ok bool } — its
             // sendability IS the payload's sendability (option[int] crosses,
             // option[map] does not — the aliased map inside decides).
-            TypeExpr::Option { elem, .. } => self.shape_of_type_depth(elem, depth + 1),
+            TypeExpr::Option { elem, .. } => self.shape_of_type_depth_with_params(elem, depth + 1, type_params),
             // fn-typed values are closures: captures make them unsendable at
             // boundaries (Tier 0 — the A5 perimeter).
             TypeExpr::Fn { .. } => TypeShape::Closure,
@@ -387,8 +389,7 @@ impl<'a> Checker<'a> {
                         self.fns
                             .get(name.as_str())
                             .or_else(|| self.fns.get(head))
-                            .and_then(|f| f.results.first())
-                            .map(|r| self.shape_of_type(&r.ty))
+                            .and_then(|f| Some(self.shape_of_type_with_params(&f.results.first()?.ty, &self.infer_call_type_shapes(st, f, args))))
                             .unwrap_or(TypeShape::Unknown)
                     }
                 }
@@ -408,7 +409,7 @@ impl<'a> Checker<'a> {
                             return f
                                 .results
                                 .first()
-                                .map(|r| self.shape_of_type(&r.ty))
+                                .map(|r| self.shape_of_type_with_params(&r.ty, &self.infer_call_type_shapes(st, f, args)))
                                 .unwrap_or(TypeShape::Unknown);
                         }
                     }
@@ -439,7 +440,7 @@ impl<'a> Checker<'a> {
                 {
                     if let Some(f) = self.method_decls.get(&(recv_base, head.to_string())) {
                         if let Some(r) = f.results.first() {
-                            return self.shape_of_type(&r.ty);
+                            return self.shape_of_type_with_params(&r.ty, &self.infer_call_type_shapes(st, f, args));
                         }
                     }
                 }
@@ -466,11 +467,108 @@ impl<'a> Checker<'a> {
                     });
                 recv_base
                     .and_then(|rb| self.method_decls.get(&(rb, head.to_string())))
-                    .and_then(|f| f.results.first())
-                    .map(|r| self.shape_of_type(&r.ty))
+                    .and_then(|f| Some(self.shape_of_type_with_params(&f.results.first()?.ty, &self.infer_call_type_shapes(st, f, args))))
                     .unwrap_or(TypeShape::Unknown)
             }
             _ => TypeShape::Unknown,
+        }
+    }
+
+    fn match_type_param_shape(param_ty: &TypeExpr, arg_shape: &TypeShape, tparam_names: &std::collections::HashSet<&str>, out: &mut std::collections::HashMap<String, TypeShape>, depth: usize) {
+        if depth > Self::MAX_TYPE_RESOLUTION_DEPTH || matches!(arg_shape, TypeShape::Unknown) {
+            return;
+        }
+        match (param_ty, arg_shape) {
+            (TypeExpr::Named { name, .. }, _) if tparam_names.contains(name.as_str()) => {
+                out.entry(name.clone()).or_insert_with(|| arg_shape.clone());
+            }
+            (TypeExpr::Pointer { to: p, .. }, TypeShape::Pointer(a))
+            | (TypeExpr::Slice { elem: p, .. }, TypeShape::Slice(a))
+            | (TypeExpr::Array { elem: p, .. }, TypeShape::Array(a))
+            | (TypeExpr::Chan { elem: p, .. }, TypeShape::Chan(a)) => Self::match_type_param_shape(p, a, tparam_names, out, depth + 1),
+            (TypeExpr::Map { key, value, .. }, TypeShape::Map(k, v)) => {
+                Self::match_type_param_shape(key, k, tparam_names, out, depth + 1);
+                Self::match_type_param_shape(value, v, tparam_names, out, depth + 1);
+            }
+            (TypeExpr::Option { elem, .. }, _) => Self::match_type_param_shape(elem, arg_shape, tparam_names, out, depth + 1),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn infer_call_type_shapes(&self, st: &FnState, f: &hy_syntax::FnDecl, args: &[CallArg]) -> std::collections::HashMap<String, TypeShape> {
+        let mut out = std::collections::HashMap::new();
+        let tparams: std::collections::HashSet<&str> = f.type_params.iter().map(|tp| tp.name.as_str()).collect();
+        if !tparams.is_empty() {
+            for (p, a) in f.params.iter().zip(args.iter()) {
+                Self::match_type_param_shape(&p.ty, &self.shape_of_expr(st, &a.value), &tparams, &mut out, 0);
+            }
+            for (k, ty) in self.infer_call_type_args(st, f, args) {
+                out.entry(k).or_insert_with(|| self.shape_of_type(&ty));
+            }
+        }
+        out
+    }
+
+    fn match_type_param_ty(param_ty: &TypeExpr, arg_ty: &TypeExpr, tparam_names: &std::collections::HashSet<&str>, out: &mut std::collections::HashMap<String, TypeExpr>, depth: usize) {
+        if depth > Self::MAX_TYPE_RESOLUTION_DEPTH {
+            return;
+        }
+        match (param_ty, arg_ty) {
+            (TypeExpr::Named { name, .. }, _) if tparam_names.contains(name.as_str()) => {
+                out.entry(name.clone()).or_insert_with(|| arg_ty.clone());
+            }
+            (TypeExpr::Named { name: pn, .. }, TypeExpr::Named { name: an, .. }) => {
+                if let (Some((pb, pi)), Some((ab, ai))) = (pn.strip_suffix(']').and_then(|s| s.split_once('[')), an.strip_suffix(']').and_then(|s| s.split_once('['))) {
+                    if pb == ab && tparam_names.contains(pi) {
+                        if let Some(hy_syntax::Decl::TypeAlias(ta)) = hy_syntax::parse_file("", &format!("type _a = {ai}")).ok().and_then(|ast| ast.decls.into_iter().next()) {
+                            out.entry(pi.to_string()).or_insert(ta.ty);
+                        }
+                    }
+                }
+            }
+            (TypeExpr::Pointer { to: p, .. }, TypeExpr::Pointer { to: a, .. })
+            | (TypeExpr::Slice { elem: p, .. }, TypeExpr::Slice { elem: a, .. })
+            | (TypeExpr::Array { elem: p, .. }, TypeExpr::Array { elem: a, .. })
+            | (TypeExpr::Chan { elem: p, .. }, TypeExpr::Chan { elem: a, .. })
+            | (TypeExpr::Option { elem: p, .. }, TypeExpr::Option { elem: a, .. }) => Self::match_type_param_ty(p, a, tparam_names, out, depth + 1),
+            (TypeExpr::Map { key: pk, value: pv, .. }, TypeExpr::Map { key: ak, value: av, .. }) => {
+                Self::match_type_param_ty(pk, ak, tparam_names, out, depth + 1);
+                Self::match_type_param_ty(pv, av, tparam_names, out, depth + 1);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn infer_call_type_args(&self, st: &FnState, f: &hy_syntax::FnDecl, args: &[CallArg]) -> std::collections::HashMap<String, TypeExpr> {
+        let mut out = std::collections::HashMap::new();
+        let tparams: std::collections::HashSet<&str> = f.type_params.iter().map(|tp| tp.name.as_str()).collect();
+        if !tparams.is_empty() {
+            for (p, a) in f.params.iter().zip(args.iter()) {
+                if let Some(arg_ty) = self.ty_of_expr(st, &a.value) {
+                    Self::match_type_param_ty(&p.ty, &arg_ty, &tparams, &mut out, 0);
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn subst_call_type_params(ty: &TypeExpr, type_params: &std::collections::HashMap<String, TypeExpr>) -> TypeExpr {
+        Self::subst_call_type_params_depth(ty, type_params, 0)
+    }
+
+    fn subst_call_type_params_depth(ty: &TypeExpr, type_params: &std::collections::HashMap<String, TypeExpr>, depth: usize) -> TypeExpr {
+        if type_params.is_empty() || depth > Self::MAX_TYPE_RESOLUTION_DEPTH {
+            return ty.clone();
+        }
+        match ty {
+            TypeExpr::Named { name, .. } => type_params.get(name.as_str()).cloned().unwrap_or_else(|| ty.clone()),
+            TypeExpr::Pointer { to, span } => TypeExpr::Pointer { to: Box::new(Self::subst_call_type_params_depth(to, type_params, depth + 1)), span: *span },
+            TypeExpr::Slice { elem, span } => TypeExpr::Slice { elem: Box::new(Self::subst_call_type_params_depth(elem, type_params, depth + 1)), span: *span },
+            TypeExpr::Array { len, elem, span } => TypeExpr::Array { len: len.clone(), elem: Box::new(Self::subst_call_type_params_depth(elem, type_params, depth + 1)), span: *span },
+            TypeExpr::Map { key, value, span } => TypeExpr::Map { key: Box::new(Self::subst_call_type_params_depth(key, type_params, depth + 1)), value: Box::new(Self::subst_call_type_params_depth(value, type_params, depth + 1)), span: *span },
+            TypeExpr::Chan { dir, elem, span } => TypeExpr::Chan { dir: *dir, elem: Box::new(Self::subst_call_type_params_depth(elem, type_params, depth + 1)), span: *span },
+            TypeExpr::Option { elem, span } => TypeExpr::Option { elem: Box::new(Self::subst_call_type_params_depth(elem, type_params, depth + 1)), span: *span },
+            TypeExpr::Fn { params, results, span } => TypeExpr::Fn { params: params.iter().map(|p| hy_syntax::Param { name: p.name.clone(), ty: Self::subst_call_type_params_depth(&p.ty, type_params, depth + 1), span: p.span }).collect(), results: results.iter().map(|r| Self::subst_call_type_params_depth(r, type_params, depth + 1)).collect(), span: *span },
         }
     }
 
@@ -740,8 +838,7 @@ impl<'a> Checker<'a> {
                     self.fns
                         .get(name.as_str())
                         .or_else(|| self.fns.get(head))
-                        .and_then(|f| f.results.first())
-                        .map(|r| r.ty.clone())
+                        .and_then(|f| Some(Self::subst_call_type_params(&f.results.first()?.ty, &self.infer_call_type_args(st, f, args))))
                 }
                 Expr::Field { base, name, .. } => {
                     let head = Self::base_named_type_str(name);
@@ -749,7 +846,7 @@ impl<'a> Checker<'a> {
                         if self.lookup_binding(st, root).is_none() {
                             let full = format!("{}.{}", root, head);
                             if let Some(f) = self.fns.get(full.as_str()) {
-                                return f.results.first().map(|r| r.ty.clone());
+                                return f.results.first().map(|r| Self::subst_call_type_params(&r.ty, &self.infer_call_type_args(st, f, args)));
                             }
                         }
                     }
@@ -773,8 +870,7 @@ impl<'a> Checker<'a> {
                         if let Some(ret) = self
                             .method_decls
                             .get(&(rb, head.to_string()))
-                            .and_then(|f| f.results.first())
-                            .map(|r| r.ty.clone())
+                            .and_then(|f| Some(Self::subst_call_type_params(&f.results.first()?.ty, &self.infer_call_type_args(st, f, args))))
                         {
                             return Some(ret);
                         }
@@ -1099,6 +1195,15 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn call_result_tys(&self, st: &FnState, callee: &Expr) -> Option<Vec<TypeExpr>> {
+        self.call_result_tys_with_args(st, callee, &[])
+    }
+
+    pub(crate) fn call_result_tys_with_args(
+        &self,
+        st: &FnState,
+        callee: &Expr,
+        args: &[CallArg],
+    ) -> Option<Vec<TypeExpr>> {
         match crate::model::unwrap_parens(callee) {
             Expr::FnLit { results, .. } => Some(results.iter().map(|r| r.ty.clone()).collect()),
             Expr::Ident { name, .. } => {
@@ -1114,7 +1219,10 @@ impl<'a> Checker<'a> {
                 self.fns
                     .get(name.as_str())
                     .or_else(|| self.fns.get(head))
-                    .map(|f| f.results.iter().map(|r| r.ty.clone()).collect())
+                    .map(|f| {
+                        let ty_map = self.infer_call_type_args(st, f, args);
+                        f.results.iter().map(|r| Self::subst_call_type_params(&r.ty, &ty_map)).collect()
+                    })
             }
             Expr::Field { base, name, .. } => {
                 let head = Self::base_named_type_str(name);
@@ -1122,7 +1230,8 @@ impl<'a> Checker<'a> {
                     if self.lookup_binding(st, root).is_none() {
                         let full = format!("{}.{}", root, head);
                         if let Some(f) = self.fns.get(full.as_str()) {
-                            return Some(f.results.iter().map(|r| r.ty.clone()).collect());
+                            let ty_map = self.infer_call_type_args(st, f, args);
+                            return Some(f.results.iter().map(|r| Self::subst_call_type_params(&r.ty, &ty_map)).collect());
                         }
                     }
                 }
@@ -1145,10 +1254,32 @@ impl<'a> Checker<'a> {
                     })?;
                 self.method_decls
                     .get(&(recv_base, head.to_string()))
-                    .map(|f| f.results.iter().map(|r| r.ty.clone()).collect())
+                    .map(|f| {
+                        let ty_map = self.infer_call_type_args(st, f, args);
+                        f.results.iter().map(|r| Self::subst_call_type_params(&r.ty, &ty_map)).collect()
+                    })
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn call_result_shapes_with_args(
+        &self,
+        st: &FnState,
+        callee: &Expr,
+        args: &[CallArg],
+    ) -> Option<Vec<TypeShape>> {
+        let tys = self.call_result_tys_with_args(st, callee, args)?;
+        let shape_map = match crate::model::unwrap_parens(callee) {
+            Expr::Ident { name, .. } if self.lookup_binding(st, name).is_none() => self
+                .fns
+                .get(name.as_str())
+                .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                .map(|f| self.infer_call_type_shapes(st, f, args)),
+            _ => None,
+        }
+        .unwrap_or_default();
+        Some(tys.iter().map(|ty| self.shape_of_type_with_params(ty, &shape_map)).collect())
     }
 
     /// Shapes for a multi-name define/assign from one value (`v, ok := m[k]`,
@@ -1180,19 +1311,15 @@ impl<'a> Checker<'a> {
             Expr::Try { operand, .. } => (crate::model::unwrap_parens(operand), true),
             other => (other, false),
         };
-        if let Expr::Call { callee, .. } = call_expr {
-            if let Some(results) = self.call_result_tys(st, callee) {
+        if let Expr::Call { callee, args, .. } = call_expr {
+            if let Some(results) = self.call_result_shapes_with_args(st, callee, args) {
                 let avail = if is_try {
                     results.len().saturating_sub(1)
                 } else {
                     results.len()
                 };
                 if avail == n_names {
-                    return results
-                        .iter()
-                        .take(n_names)
-                        .map(|ty| self.shape_of_type(ty))
-                        .collect();
+                    return results.into_iter().take(n_names).collect();
                 }
             }
         }
@@ -1219,8 +1346,8 @@ impl<'a> Checker<'a> {
             Expr::Try { operand, .. } => (crate::model::unwrap_parens(operand), true),
             other => (other, false),
         };
-        if let Expr::Call { callee, .. } = call_expr {
-            if let Some(results) = self.call_result_tys(st, callee) {
+        if let Expr::Call { callee, args, .. } = call_expr {
+            if let Some(results) = self.call_result_tys_with_args(st, callee, args) {
                 let avail = if is_try {
                     results.len().saturating_sub(1)
                 } else {

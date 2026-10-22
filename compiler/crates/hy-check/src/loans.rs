@@ -1899,9 +1899,9 @@ impl<'a> Checker<'a> {
                 // A later result can share storage even when result 0 is primitive.
                 let shares_storage = self.shape_may_share(&result)
                     || matches!(result, TypeShape::Unknown)
-                    || self.call_result_tys(st, callee).is_some_and(|results| {
-                        results.iter().any(|ty| self.shape_may_share(&self.shape_of_type(ty)))
-                    });
+                    || self
+                        .call_result_shapes_with_args(st, callee, args)
+                        .is_some_and(|results| results.iter().any(|sh| self.shape_may_share(sh)));
                 if !shares_storage {
                     return false;
                 }
@@ -2005,11 +2005,10 @@ impl<'a> Checker<'a> {
     /// A tuple call can carry a borrow in any result, not just the first.
     fn expr_has_borrow_shape(&self, st: &FnState, e: &Expr) -> bool {
         let inner = unwrap_parens(e);
-        if let Expr::Call { callee, .. } = inner {
-            if let Some(results) = self.call_result_tys(st, callee) {
-                return results.iter().any(|ty| {
-                    let shape = self.shape_of_type(ty);
-                    field_borrow_kind(&shape).is_some() || matches!(shape, TypeShape::Unknown)
+        if let Expr::Call { callee, args, .. } = inner {
+            if let Some(results) = self.call_result_shapes_with_args(st, callee, args) {
+                return results.iter().any(|shape| {
+                    field_borrow_kind(shape).is_some() || matches!(shape, TypeShape::Unknown)
                 });
             }
         }
