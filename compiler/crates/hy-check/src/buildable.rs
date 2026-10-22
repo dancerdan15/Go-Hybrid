@@ -633,6 +633,7 @@ impl<'a> Collector<'a> {
     fn fn_decl(&mut self, f: &FnDecl) {
         if let Some(r) = &f.receiver {
             self.ty(&r.ty);
+            self.check_field_method_collision(f, r);
         }
         for p in &f.params {
             self.ty(&p.ty);
@@ -691,6 +692,33 @@ impl<'a> Collector<'a> {
         self.fn_results_all_named = outer_named;
         self.fn_results_error_tail = outer_err;
         self.pop_scope();
+    }
+
+    /// #1119 — Go rejects a struct type that declares both a field and a method
+    /// with the same name (`field and method with the same name <x>`).
+    fn check_field_method_collision(&mut self, f: &FnDecl, r: &hy_syntax::Receiver) {
+        if f.name == "_" {
+            return;
+        }
+        let rk = self.kind_of_ty(&r.ty, 0);
+        let Some(sname) = self.struct_base_name(&rk) else {
+            return;
+        };
+        let has_field = self
+            .ck
+            .structs
+            .get(&sname)
+            .is_some_and(|fields| fields.iter().any(|(fname, _)| fname != "_" && fname == &f.name));
+        if has_field {
+            self.emit_e1002(
+                f.span,
+                format!(
+                    "method `{}` on `{}` has the same name as field `{}.{}` — Go refuses `field and method with the same name {}` (HYB-E1002)",
+                    f.name, sname, sname, f.name, f.name
+                ),
+                "a struct cannot have both a field and a method with the same name; rename the field or the method",
+            );
+        }
     }
 
     fn local(&mut self, l: &LocalDecl) {
