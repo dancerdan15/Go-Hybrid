@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("check_conflict_markers.py")
 SPEC = importlib.util.spec_from_file_location("conflict_markers", SCRIPT)
@@ -71,6 +72,31 @@ class MarkerDetectionTests(unittest.TestCase):
     def test_git_directory_is_skipped(self):
         root = self._tree({".git/COMMIT_EDITMSG": "<<<<<<< HEAD\n>>>>>>> main\n"})
         self.assertEqual(list(MOD.scan(str(root))), [])
+
+    def test_scan_file_invalid_utf8_raises_oserror(self):
+        for rel in ("broken.py", "lib.rs", "README.md"):
+            with self.subTest(rel=rel):
+                root = self._tree({})
+                target = root / rel
+                target.write_bytes(b"\xff\xfe\n<<<<<<< HEAD\n=======\n>>>>>>> main\n")
+                with self.assertRaises(OSError) as ctx:
+                    MOD.scan_file(str(target))
+                self.assertIn(str(target), str(ctx.exception))
+                with self.assertRaises(OSError) as scan_ctx:
+                    list(MOD.scan(str(root)))
+                self.assertIn(str(target), str(scan_ctx.exception))
+
+    def test_unknown_extension_with_invalid_utf8_is_skipped(self):
+        root = self._tree({})
+        (root / "artifact.bin").write_bytes(b"\xff\xfe\n<<<<<<< HEAD\n>>>>>>> main\n")
+        self.assertEqual(list(MOD.scan(str(root))), [])
+
+    def test_utf8_bom_on_line_one_marker_is_found(self):
+        root = self._tree({"bom.py": "\ufeff<<<<<<< HEAD\n=======\n>>>>>>> main\n"})
+        hits = list(MOD.scan(str(root)))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][0], "bom.py")
+        self.assertEqual(hits[0][1], 1)
 
 
 class WorkflowStructureTests(unittest.TestCase):
@@ -169,6 +195,23 @@ class WorkflowStructureTests(unittest.TestCase):
         })
         self.assertEqual(list(MOD.scan(str(root))), [])
 
+    def test_scan_workflow_file_invalid_utf8_raises_oserror(self):
+        for rel in (".github/workflows/ci.yml", ".github/workflows/deploy.yaml"):
+            with self.subTest(rel=rel):
+                root = self._tree({})
+                target = root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"\xff\xfe\nname: ci\non: push\necho bad\n")
+                with self.assertRaises(OSError) as ctx:
+                    MOD.scan_workflow_file(str(target))
+                self.assertIn(str(target), str(ctx.exception))
+
+    def test_utf8_bom_on_line_one_workflow_is_accepted(self):
+        root = self._tree({
+            ".github/workflows/ci.yml": "\ufeffname: ci\non: push\njobs: {}\n",
+        })
+        self.assertEqual(list(MOD.scan(str(root))), [])
+
 
 class CliTests(unittest.TestCase):
     def _run(self, root):
@@ -235,6 +278,38 @@ class CliTests(unittest.TestCase):
             res = self._run(td)
             self.assertEqual(res.returncode, 1)
             self.assertIn("conflict marker", res.stderr.lower())
+
+    def test_invalid_utf8_cannot_report_a_clean_scan(self):
+        for rel in ("broken.py", ".github/workflows/ci.yml", ".github/workflows/release.yaml"):
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory() as td:
+                path = Path(td, rel)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"\xff\xfe\n<<<<<<< HEAD\n=======\n>>>>>>> main\n")
+                res = self._run(td)
+                self.assertEqual(res.returncode, 2)
+                self.assertIn("scan error:", res.stderr)
+                self.assertIn(os.path.basename(rel), res.stderr)
+                self.assertNotIn("conflict markers: none", res.stdout)
+                self.assertNotIn("Traceback", res.stderr)
+
+    def test_file_scanners_propagate_read_errors(self):
+        for scanner, rel in (
+            (MOD.scan_file, "unreadable.py"),
+            (MOD.scan_workflow_file, ".github/workflows/ci.yml"),
+        ):
+            with self.subTest(scanner=scanner.__name__):
+                with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+                    with self.assertRaises(OSError) as ctx:
+                        scanner(rel)
+                self.assertIn(rel, str(ctx.exception))
+                self.assertIn("denied", str(ctx.exception))
+
+    def test_scan_propagates_walk_directory_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("os.scandir", side_effect=PermissionError("dir denied")):
+                with self.assertRaises(PermissionError) as ctx:
+                    list(MOD.scan(td))
+            self.assertIn("dir denied", str(ctx.exception))
 
 
 if __name__ == "__main__":

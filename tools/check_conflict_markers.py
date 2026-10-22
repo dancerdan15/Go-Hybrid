@@ -79,6 +79,8 @@ def scan_file(path):
         with open(path, encoding="utf-8") as f:
             for n, line in enumerate(f, 1):
                 stripped = line.rstrip("\n")
+                if n == 1:
+                    stripped = stripped.removeprefix("\ufeff")
                 if START_RE.match(stripped):
                     open_start = (n, stripped)
                 elif END_RE.match(stripped) and open_start is not None:
@@ -87,8 +89,8 @@ def scan_file(path):
         # An unterminated `<<<<<<<` is still a marker that must not ship.
         if open_start is not None:
             hits.append(open_start)
-    except (UnicodeDecodeError, OSError):
-        return []
+    except (UnicodeDecodeError, OSError) as error:
+        raise OSError(f"{path}: {error}") from error
     return hits
 
 
@@ -106,6 +108,8 @@ def scan_workflow_file(path):
         with open(path, encoding="utf-8") as f:
             for n, line in enumerate(f, 1):
                 stripped = line.rstrip("\n")
+                if n == 1:
+                    stripped = stripped.removeprefix("\ufeff")
                 if not stripped.strip():
                     continue
                 if stripped[0] in " \t":
@@ -120,8 +124,8 @@ def scan_workflow_file(path):
                 if TOP_LEVEL_KEY_RE.match(stripped):
                     continue
                 hits.append((n, stripped))
-    except (UnicodeDecodeError, OSError):
-        return []
+    except (UnicodeDecodeError, OSError) as error:
+        raise OSError(f"{path}: {error}") from error
     return hits
 
 
@@ -133,13 +137,17 @@ def _is_workflow(path):
     )
 
 
+def _raise_walk_error(error):
+    raise error
+
+
 def scan(root):
     """Yield (relpath, line_no, line, kind) for every structural defect.
 
     `kind` is "marker" for a conflict block or "workflow" for a column-zero
     line that cannot parse as workflow YAML.
     """
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise_walk_error):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fn in filenames:
             full = os.path.join(dirpath, fn)
@@ -158,7 +166,11 @@ def main():
     if not os.path.isdir(args.root):
         print(f"usage error: {args.root} is not a directory", file=sys.stderr)
         return 2
-    found = list(scan(args.root))
+    try:
+        found = list(scan(args.root))
+    except OSError as error:
+        print(f"scan error: {error}", file=sys.stderr)
+        return 2
     if not found:
         print("conflict markers: none")
         return 0
