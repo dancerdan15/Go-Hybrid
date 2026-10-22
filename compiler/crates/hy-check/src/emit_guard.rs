@@ -102,9 +102,9 @@ impl<'a> Checker<'a> {
                     }
                 }
                 for v in &l.values {
-                    self.check_expr_emit_guard(st, v);
                     // `n := &m[k].f` — the O8 store-back place must build.
                     self.check_slot_loan_operand_addressable(st, v);
+                    self.check_expr_emit_guard(st, v);
                 }
                 if deep {
                     if matches!(l.kind, hy_syntax::LocalKind::Const) {
@@ -137,9 +137,15 @@ impl<'a> Checker<'a> {
                     // `m[k].f = v` — a Go map element is not addressable.
                     self.check_assign_target_addressable(st, t);
                 }
-                for v in values {
+                for (i, v) in values.iter().enumerate() {
+                    if *op == AssignOp::Assign
+                        && targets
+                            .get(i)
+                            .is_some_and(|t| matches!(t.kind, PlaceKind::Ident(_)))
+                    {
+                        self.check_slot_loan_operand_addressable(st, v);
+                    }
                     self.check_expr_emit_guard(st, v);
-                    self.check_slot_loan_operand_addressable(st, v);
                 }
                 // `x <<= -1` — the compound form of HYB-E6005.
                 if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) && values.len() == 1 {
@@ -367,6 +373,10 @@ impl<'a> Checker<'a> {
                 let ty = l.ty.clone().or_else(|| self.ty_of_expr(st, val));
                 self.define_binding(st, name, shape, ty, immutable, false, is_let);
             }
+        } else {
+            for name in &l.names {
+                self.define_binding(st, name, TypeShape::Unknown, None, immutable, false, is_let);
+            }
         }
     }
 
@@ -414,8 +424,16 @@ impl<'a> Checker<'a> {
                 self.check_expr_emit_guard(st, operand);
                 self.check_negated_const_result(st, operand, *span);
             }
+            Expr::AddrOf { operand, .. }
+            | Expr::Unary {
+                op: UnOp::Addr,
+                operand,
+                ..
+            } => {
+                self.check_expr_addr_of_addressable(st, expr);
+                self.check_expr_emit_guard(st, operand);
+            }
             Expr::Unary { operand, .. }
-            | Expr::AddrOf { operand, .. }
             | Expr::Move { operand, .. }
             | Expr::Try { operand, .. }
             | Expr::Paren { inner: operand, .. }

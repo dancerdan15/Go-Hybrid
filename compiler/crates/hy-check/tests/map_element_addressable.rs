@@ -459,3 +459,282 @@ fn main() {
         "HYB-E3104",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Projected map-element borrows in argument and expression positions (#1046)
+// ---------------------------------------------------------------------------
+
+fn rejects_projected_borrow(src: &str) {
+    let r = check(src);
+    let cs = error_codes(&r);
+    assert_eq!(
+        cs.iter().filter(|c| *c == "HYB-E3104").count(),
+        1,
+        "expected exactly one HYB-E3104, got {:?}\nsrc:\n{}",
+        cs,
+        src
+    );
+    assert_eq!(
+        cs.iter().filter(|c| *c == "HYB-E2010").count(),
+        1,
+        "expected exactly one HYB-E2010, got {:?}\nsrc:\n{}",
+        cs,
+        src
+    );
+    assert_eq!(r.verdict, Verdict::Reject, "src:\n{}", src);
+}
+
+#[test]
+fn rejects_projected_map_field_borrow_in_call_arg() {
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    touch(&m["a"].bal)
+}
+"#,
+    );
+}
+
+#[test]
+fn rejects_projected_map_array_elem_borrow_in_call_arg() {
+    rejects_projected_borrow(
+        r#"fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    m := map[string][2]int{"a": [2]int{1, 2}}
+    touch(&m["a"][0])
+}
+"#,
+    );
+}
+
+#[test]
+fn rejects_projected_map_nested_chain_and_parens_in_call_arg() {
+    rejects_projected_borrow(
+        r#"struct acct { arr [2]int }
+struct bank { accts map[string]acct }
+fn touch(p *int) { _ = p }
+fn main() {
+    b := bank{accts: map[string]acct{"a": acct{arr: [2]int{1, 2}}}}
+    touch((&b.accts["a"].arr[0]))
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct { bal int }
+fn touch(p *int) { _ = p }
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    touch(&((m["a"]).bal))
+}
+"#,
+    );
+    let r = check(
+        r#"struct acct { bal int }
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    q := (&m["a"].bal)
+    fmt.println("{q}")
+}
+"#,
+    );
+    assert_eq!(error_codes(&r), vec!["HYB-E2010".to_string()]);
+}
+
+#[test]
+fn rejects_projected_map_borrow_in_composite_literals() {
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    ps := []*int{&m["a"].bal}
+    fmt.println("{ps[0]}")
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+struct holder {
+    p *int
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    h := holder{p: &m["a"].bal}
+    fmt.println("{h.p}")
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    pm := map[string]*int{"x": &m["a"].bal}
+    fmt.println("{pm["x"]}")
+}
+"#,
+    );
+}
+
+#[test]
+fn rejects_projected_map_borrow_in_nested_expr_and_stmt_positions() {
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    if &m["a"].bal != nil {
+        fmt.println("non-nil")
+    }
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    x := 0
+    ps := []*int{&x}
+    ps[0] = &m["a"].bal
+    fmt.println("{ps[0]}")
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    defer touch(&m["a"].bal)
+}
+"#,
+    );
+}
+
+#[test]
+fn rejects_projected_map_borrow_inside_closure_bodies() {
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1}}
+    f := fn() {
+        touch(&m["a"].bal)
+        for m in 0..1 {
+            fmt.println("{m}")
+        }
+    }
+    f()
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    g := fn(m map[string]acct) {
+        touch(&m["a"].bal)
+    }
+    g(map[string]acct{"a": acct{bal: 1}})
+}
+"#,
+    );
+    rejects_projected_borrow(
+        r#"struct acct {
+    bal int
+}
+
+fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    h := fn() {
+        m := map[string]acct{"a": acct{bal: 1}}
+        inner := fn() {
+            touch(&m["a"].bal)
+        }
+        inner()
+    }
+    h()
+}
+"#,
+    );
+}
+
+#[test]
+fn accepts_addressable_hops_and_copy_out_in_call_args() {
+    accepts(
+        r#"struct acct {
+    bal int
+    sl []int
+}
+
+fn touch(p *int) {
+    _ = p
+}
+
+fn main() {
+    m := map[string]acct{"a": acct{bal: 1, sl: []int{2}}}
+    touch(&m["a"].sl[0])
+    mp := map[string]*acct{"a": &acct{bal: 3, sl: []int{}}}
+    touch(&mp["a"].bal)
+    ms := map[string][]acct{"a": []acct{acct{bal: 4, sl: []int{}}}}
+    touch(&ms["a"][0].bal)
+    tmp := m["a"]
+    touch(&tmp.bal)
+    sh := fn(m []acct) {
+        touch(&m[0].bal)
+    }
+    sh([]acct{acct{bal: 5, sl: []int{}}})
+    for _, m in []acct{acct{bal: 6, sl: []int{}}} {
+        touch(&m.bal)
+    }
+    fmt.println("{m["a"].sl[0]} {mp["a"].bal} {ms["a"][0].bal} {tmp.bal}")
+}
+"#,
+    );
+}
+

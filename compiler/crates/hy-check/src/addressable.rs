@@ -30,7 +30,7 @@ use hy_syntax::{Block, Expr, ForKind, MatchPattern, Param, Place, PlaceKind, Sel
 impl<'a> Checker<'a> {
     /// `target` of an assignment (any operator, including `++`/`--`).
     pub(crate) fn check_assign_target_addressable(&mut self, st: &FnState, target: &Place) {
-        if self.closure_rebinds(target.root()) {
+        if self.closure_rebinds(st, target.root()) {
             return;
         }
         let Some(elem) = self.place_unassignable_at(st, target) else {
@@ -49,13 +49,14 @@ impl<'a> Checker<'a> {
     /// copy back into `operand` at the loan's last use, so `operand` must
     /// be assignable in Go.
     pub(crate) fn check_slot_loan_operand_addressable(&mut self, st: &FnState, value: &Expr) {
+        let value = unwrap_parens(value);
         let Some(operand) = as_addr_of(value) else {
             return;
         };
         if !matches!(operand, Expr::Index { .. } | Expr::Field { .. }) {
             return;
         }
-        if expr_root(operand).is_some_and(|r| self.closure_rebinds(r)) {
+        if expr_root(operand).is_some_and(|r| self.closure_rebinds(st, r)) {
             return;
         }
         let Some(elem) = self.expr_unassignable_at(st, operand) else {
@@ -69,6 +70,59 @@ impl<'a> Checker<'a> {
             elem
         );
         self.push_unaddressable(msg, &elem, value.span());
+    }
+
+    /// `&operand` in a non-binding expression position (call argument,
+    /// composite literal, return, send, condition, etc.) where `operand` is a
+    /// struct field or array element projected from a map element (`&m[k].f`,
+    /// `&m[k][i]`): it is neither a binding-level O8 loan (HYB-E3104) nor a
+    /// Go-addressable place (HYB-E2010).
+    pub(crate) fn check_expr_addr_of_addressable(&mut self, st: &FnState, expr: &Expr) {
+        let Some(operand) = as_addr_of(expr) else {
+            return;
+        };
+        if !matches!(operand, Expr::Index { .. } | Expr::Field { .. }) {
+            return;
+        }
+        if expr_root(operand).is_some_and(|r| self.closure_rebinds(st, r)) {
+            return;
+        }
+        let Some(elem) = self.expr_unassignable_at(st, operand) else {
+            return;
+        };
+        if self
+            .diags
+            .iter()
+            .any(|d| d.span == expr.span() && d.code == "HYB-E2010")
+        {
+            return;
+        }
+        let op_str = operand.render();
+        let elem = elem.render();
+        if !self
+            .diags
+            .iter()
+            .any(|d| d.span == expr.span() && d.code == "HYB-E3104")
+        {
+            let slot_msg = format!(
+                "cannot take the address of `{op_str}` here: `{op_str}` projects from map slot `{elem}`, which is not addressable in Go, and an O8 slot loan is only lowered at a whole-slot binding (`n := &{elem}` or `n = &{elem}`) (HYB-E3104)"
+            );
+            self.diags.push(
+                Diagnostic::error("HYB-E3104", self.path.clone(), expr.span(), slot_msg).with_notes(
+                    vec![
+                        "a Go map index has no stable address; the emitter lowers `&m[k]` to a copy-out + store-back only when `&m[k]` is the right-hand side of a local binding or plain assignment".to_string(),
+                        format!(
+                            "copy the slot to a local first (`tmp := {elem}`) and pass `&tmp.{}` (or take the whole slot loan `n := &{elem}` if mutations must write back)",
+                            op_str.strip_prefix(&format!("{elem}.")).unwrap_or(&op_str)
+                        ),
+                    ],
+                ),
+            );
+        }
+        let addr_msg = format!(
+            "cannot take the address of `{op_str}` — it is part of the map element `{elem}`, and a Go map element is not addressable (HYB-E2010)"
+        );
+        self.push_unaddressable(addr_msg, &elem, expr.span());
     }
 
     fn push_unaddressable(&mut self, msg: String, elem: &str, span: hy_diag::Span) {
@@ -121,7 +175,8 @@ impl<'a> Checker<'a> {
     }
 
     fn expr_unaddressable_at<'e>(&self, st: &FnState, e: &'e Expr) -> Option<&'e Expr> {
-        match unwrap_parens(e) {
+        let e = unwrap_parens(e);
+        match e {
             Expr::Index { base, .. } => match self.shape_of_expr(st, base) {
                 TypeShape::Map(..) => Some(e),
                 TypeShape::Array(_) => self.expr_unaddressable_at(st, base),
@@ -135,8 +190,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn closure_rebinds(&self, name: &str) -> bool {
-        self.closure_bound.iter().any(|s| s.contains(name))
+    fn closure_rebinds(&self, st: &FnState, name: &str) -> bool {
+        !self.closure_bound.is_empty() && self.lookup_binding(st, name).is_none()
     }
 
     /// Entering a closure body in the emit-guard deep walk.
