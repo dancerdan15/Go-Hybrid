@@ -1,0 +1,58 @@
+{
+  "discover_cases": [
+    {
+      "name": "default_pattern_when_only_start_dir_given",
+      "workflow": "python3 -m unittest discover -s tools\n",
+      "expected_discoveries": [["tools", "test*.py"]],
+      "suites": ["tools/test_alpha.py"],
+      "expected_unregistered": []
+    },
+    {
+      "name": "default_pattern_with_long_start_dir_equals",
+      "workflow": "python3 -m unittest discover --start-directory=tools/fuzz -v\n",
+      "expected_discoveries": [["tools/fuzz", "test*.py"]],
+      "suites": ["tools/fuzz/test_hyfuzz.py", "tools/test_orphan.py"],
+      "expected_unregistered": ["tools/test_orphan.py"]
+    },
+    {
+      "name": "default_start_and_default_pattern",
+      "workflow": "python3 -m unittest discover -v\n",
+      "expected_discoveries": [[".", "test*.py"]],
+      "suites": ["tools/__init__.py", "tools/test_pkg_suite.py"],
+      "expected_unregistered": []
+    },
+    {
+      "name": "top_level_directory_option_preserved",
+      "workflow": "python3 -m unittest discover -t . -s tools -p test_job_cli.py\n",
+      "expected_discoveries": [["tools", "test_job_cli.py"]],
+      "suites": ["tools/test_job_cli.py"],
+      "expected_unregistered": []
+    }
+  ],
+  "direct_cases": [
+    {
+      "name": "leading_dot_slash_direct_path",
+      "workflow": "python3 ./tests/test_install_runtime.py\n",
+      "relpath": "tests/test_install_runtime.py",
+      "expected": true
+    },
+    {
+      "name": "inner_dot_segment_direct_path",
+      "workflow": "python3 tests/./test_install_runtime.py\n",
+      "relpath": "tests/test_install_runtime.py",
+      "expected": true
+    },
+    {
+      "name": "redundant_slashes_direct_path",
+      "workflow": "python3 tests//test_install_runtime.py\n",
+      "relpath": "tests/test_install_runtime.py",
+      "expected": true
+    },
+    {
+      "name": "hash_based_pycs_equals_option_before_direct_path",
+      "workflow": "python3 --check-hash-based-pycs=default ./tests/./test_install_runtime.py\n",
+      "relpath": "tests/test_install_runtime.py",
+      "expected": true
+    }
+  ]
+}

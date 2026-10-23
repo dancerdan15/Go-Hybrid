@@ -1,0 +1,67 @@
+{
+  "malformed_discover_cases": [
+    {
+      "name": "start_dir_flag_followed_by_pattern_flag",
+      "workflow": "python3 -m unittest discover -s -p test_foo.py\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    },
+    {
+      "name": "pattern_flag_followed_by_verbose_flag",
+      "workflow": "python3 -m unittest discover -s tools -p -v\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    },
+    {
+      "name": "dangling_pattern_flag_at_end_of_command",
+      "workflow": "python3 -m unittest discover -s tools -p\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    },
+    {
+      "name": "dangling_start_directory_flag_at_end_of_command",
+      "workflow": "python3 -m unittest discover -p test_foo.py -s\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    },
+    {
+      "name": "empty_long_option_equals_values",
+      "workflow": "python3 -m unittest discover --start-directory= --pattern=test_foo.py\npython3 -m unittest discover --start-directory=tools --pattern=\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    },
+    {
+      "name": "dangling_top_level_directory_flag",
+      "workflow": "python3 -m unittest discover -s tools -p test_foo.py -t\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    },
+    {
+      "name": "malformed_interpreter_options_missing_values",
+      "workflow": "python3 -W\npython3 -W -m unittest discover -s tools -p test_foo.py\npython3 -X -m unittest discover -s tools -p test_foo.py\npython3 --check-hash-based-pycs= -m unittest discover -s tools -p test_foo.py\n",
+      "suites": ["tools/test_foo.py"],
+      "expected_discoveries": [],
+      "expected_unregistered": ["tools/test_foo.py"]
+    }
+  ],
+  "malformed_direct_cases": [
+    {
+      "name": "parent_traversal_in_direct_path_rejected",
+      "workflow": "python3 missing/../tests/test_install_runtime.py\n",
+      "relpath": "tests/test_install_runtime.py",
+      "expected": false
+    },
+    {
+      "name": "warning_flag_swallowing_direct_flag_rejected",
+      "workflow": "python3 -W -u tests/test_install_runtime.py\n",
+      "relpath": "tests/test_install_runtime.py",
+      "expected": false
+    }
+  ]
+}

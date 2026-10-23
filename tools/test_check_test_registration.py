@@ -10,12 +10,15 @@ guard covers two invocation styles, and both are pinned here:
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+
+FIXTURES_DIR = Path(__file__).resolve().parent / "tests"
 
 SPEC = importlib.util.spec_from_file_location(
     "check_test_registration", Path(__file__).with_name("check_test_registration.py"))
@@ -316,6 +319,106 @@ class GuardMisuseTests(unittest.TestCase):
 
     def test_start_directory_escaping_repo_root_is_rejected(self):
         self.assertEqual(self.run_main("python3 -m unittest discover -s .. -p 'test_*.py'\n", ["tools/test_x.py"]), 1)
+
+    def test_missing_workflow_file_exits_two(self):
+        with tempfile.TemporaryDirectory(prefix="hybrid-guard-") as temporary:
+            root = Path(temporary)
+            (root / "tools").mkdir()
+            (root / "tools/test_x.py").write_text("# suite\n", encoding="utf-8")
+            missing_workflow = root / "nonexistent_ci.yml"
+            stderr = io.StringIO()
+            original = guard.sys.argv
+            guard.sys.argv = ["check_test_registration.py",
+                              "--workflow", str(missing_workflow), "--root", str(root)]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(stderr):
+                    code = guard.main()
+            finally:
+                guard.sys.argv = original
+            self.assertEqual(code, 2)
+            self.assertIn("REGISTRATION CHECK ERROR:", stderr.getvalue())
+
+    def test_directory_as_workflow_exits_two(self):
+        with tempfile.TemporaryDirectory(prefix="hybrid-guard-") as temporary:
+            root = Path(temporary)
+            (root / "tools").mkdir()
+            (root / "tools/test_x.py").write_text("# suite\n", encoding="utf-8")
+            stderr = io.StringIO()
+            original = guard.sys.argv
+            guard.sys.argv = ["check_test_registration.py",
+                              "--workflow", str(root / "tools"), "--root", str(root)]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(stderr):
+                    code = guard.main()
+            finally:
+                guard.sys.argv = original
+            self.assertEqual(code, 2)
+            self.assertIn("REGISTRATION CHECK ERROR:", stderr.getvalue())
+
+    def test_missing_or_file_root_exits_two(self):
+        with tempfile.TemporaryDirectory(prefix="hybrid-guard-") as temporary:
+            root = Path(temporary)
+            workflow = root / "ci.yml"
+            workflow.write_text("python3 -m unittest discover -s tools -p test_x.py\n",
+                                encoding="utf-8")
+            for bad_root in (root / "does_not_exist", workflow):
+                with self.subTest(bad_root=bad_root.name):
+                    stderr = io.StringIO()
+                    original = guard.sys.argv
+                    guard.sys.argv = ["check_test_registration.py",
+                                      "--workflow", str(workflow), "--root", str(bad_root)]
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()), \
+                                contextlib.redirect_stderr(stderr):
+                            code = guard.main()
+                    finally:
+                        guard.sys.argv = original
+                    self.assertEqual(code, 2)
+                    self.assertIn("REGISTRATION CHECK ERROR:", stderr.getvalue())
+
+    def test_default_pattern_discovery_workflow_passes_main(self):
+        self.assertEqual(
+            self.run_main("python3 -m unittest discover -s tools\n",
+                          ["tools/test_x.py"]), 0)
+
+
+class FixtureDrivenRegistrationTests(unittest.TestCase):
+    build = RegistrationTests.build
+
+    def test_edge_cases_fixture(self):
+        fixture = json.loads(
+            (FIXTURES_DIR / "registration_guard_edge_cases.json").read_text(encoding="utf-8"))
+        for case in fixture["discover_cases"]:
+            with self.subTest(case=case["name"]):
+                root, text = self.build(case["workflow"], case["suites"])
+                expected_disc = [tuple(item) for item in case["expected_discoveries"]]
+                self.assertEqual(guard.registered_discoveries(text), expected_disc)
+                missing = [rel for rel, _ in guard.unregistered(root, text)]
+                self.assertEqual(missing, case["expected_unregistered"])
+        for case in fixture["direct_cases"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(
+                    guard.is_registered_direct(case["relpath"], case["workflow"]),
+                    case["expected"])
+
+    def test_malformed_cli_fixture(self):
+        fixture = json.loads(
+            (FIXTURES_DIR / "registration_guard_malformed_cli.json").read_text(encoding="utf-8"))
+        for case in fixture["malformed_discover_cases"]:
+            with self.subTest(case=case["name"]):
+                root, text = self.build(case["workflow"], case["suites"])
+                expected_disc = [tuple(item) for item in case["expected_discoveries"]]
+                self.assertEqual(guard.registered_discoveries(text), expected_disc)
+                missing = [rel for rel, _ in guard.unregistered(root, text)]
+                self.assertEqual(missing, case["expected_unregistered"])
+        for case in fixture["malformed_direct_cases"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(
+                    guard.is_registered_direct(case["relpath"], case["workflow"]),
+                    case["expected"])
+
 
 if __name__ == "__main__":
     unittest.main()
