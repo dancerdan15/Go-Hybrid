@@ -90,8 +90,10 @@ fn same_or_shared(st: &FnState, a: &str, root_a: &str, b: &str, root_b: &str) ->
 
 #[derive(Clone, Copy)]
 struct LoopFlow {
-    continue_reach: bool,
-    loop_break_reach: bool,
+    plain_continue_reach: bool,
+    plain_break_reach: bool,
+    labeled_continue_reach: bool,
+    labeled_break_reach: bool,
     select_break_reach: Option<bool>,
 }
 
@@ -615,11 +617,31 @@ impl<'a> Checker<'a> {
         pre_moved: &HashSet<String>,
         reported_backedge: &mut HashSet<String>,
     ) {
+        let loop_span = loop_stmts
+            .first()
+            .map(|(s, _)| s.span())
+            .unwrap_or(loop_body.span);
+        let is_infinite = matches!(
+            loop_stmts.first(),
+            Some((
+                hy_syntax::Stmt::For {
+                    kind: hy_syntax::ForKind::Infinite,
+                    ..
+                },
+                _
+            ))
+        );
         if matches!(
             loop_body.stmts.last(),
             Some(hy_syntax::Stmt::Break { .. } | hy_syntax::Stmt::Return { .. })
-        ) && !Self::has_continue_after_loop_move(loop_body, st, pre_moved, outer_depth)
-        {
+        ) && !Self::has_continue_after_loop_move(
+            loop_body,
+            loop_span,
+            is_infinite,
+            st,
+            pre_moved,
+            outer_depth,
+        ) {
             return;
         }
 
@@ -634,10 +656,12 @@ impl<'a> Checker<'a> {
             .iter_mut()
             .chain(iter_st.scopes.iter_mut().flat_map(|s| s.iter_mut()))
         {
-            if b.moved.is_some() {
+            if let Some(mv) = &b.moved {
                 let root = resolve_alias(&popped_st, name);
-                if pre_moved.contains(name)
-                    || reported_backedge.contains(&root)
+                let report_key = format!("{root}@{}:{}", mv.span.start.line, mv.span.start.col);
+                if (pre_moved.contains(name) && !Self::span_contains(loop_span, mv.span))
+                    || reported_backedge.contains(&report_key)
+                    || !Self::move_span_can_reach_backedge(loop_body, is_infinite, mv.span)
                 {
                     b.moved = None;
                 } else {
@@ -738,7 +762,8 @@ impl<'a> Checker<'a> {
                 let Some(mv) = moved else { continue };
                 self.emit_use_after_move(&iter_st, u, &mv);
                 let root = resolve_alias(&iter_st, &u.name);
-                reported_backedge.insert(root.clone());
+                reported_backedge
+                    .insert(format!("{root}@{}:{}", mv.span.start.line, mv.span.start.col));
                 let mut clear_names = vec![u.name.clone(), root.clone()];
                 for a in iter_st.aliases.keys() {
                     if resolve_alias(&iter_st, a) == root {
@@ -786,11 +811,13 @@ impl<'a> Checker<'a> {
 
     fn has_continue_after_loop_move(
         loop_body: &hy_syntax::Block,
+        loop_span: hy_diag::Span,
+        is_infinite: bool,
         st: &FnState,
         pre_moved: &HashSet<String>,
         outer_depth: usize,
     ) -> bool {
-        if !block_has_continue_for_loop(loop_body) {
+        if !block_has_continue_for_loop(loop_body, true, is_infinite) {
             return false;
         }
         let mut outer = st.clone();
@@ -798,18 +825,23 @@ impl<'a> Checker<'a> {
             outer.scope_pop();
         }
         outer.env.iter().chain(outer.scopes.iter().flat_map(|s| s.iter())).any(|(name, b)| {
-            !pre_moved.contains(name)
-                && b.moved.as_ref().is_some_and(|mv| Self::move_span_can_reach_backedge(loop_body, mv.span))
+            b.moved.as_ref().is_some_and(|mv| {
+                !(pre_moved.contains(name) && !Self::span_contains(loop_span, mv.span))
+                    && Self::move_span_can_reach_backedge(loop_body, is_infinite, mv.span)
+            })
         })
     }
 
     fn move_span_can_reach_backedge(
         loop_body: &hy_syntax::Block,
+        is_infinite: bool,
         move_span: hy_diag::Span,
     ) -> bool {
         let top_flow = LoopFlow {
-            continue_reach: true,
-            loop_break_reach: false,
+            plain_continue_reach: true,
+            plain_break_reach: false,
+            labeled_continue_reach: is_infinite,
+            labeled_break_reach: false,
             select_break_reach: None,
         };
         Self::block_move_can_reach_backedge(loop_body, move_span, true, top_flow)
@@ -835,12 +867,15 @@ impl<'a> Checker<'a> {
     ) -> bool {
         match stmt {
             hy_syntax::Stmt::Return { .. } => false,
-            hy_syntax::Stmt::Continue { .. } => flow.continue_reach,
+            hy_syntax::Stmt::Continue {
+                label: Some(_), ..
+            } => flow.labeled_continue_reach,
+            hy_syntax::Stmt::Continue { label: None, .. } => flow.plain_continue_reach,
             hy_syntax::Stmt::Break {
                 label: Some(_), ..
-            } => flow.loop_break_reach,
+            } => flow.labeled_break_reach,
             hy_syntax::Stmt::Break { label: None, .. } => {
-                flow.select_break_reach.unwrap_or(flow.loop_break_reach)
+                flow.select_break_reach.unwrap_or(flow.plain_break_reach)
             }
             hy_syntax::Stmt::Block { block, .. }
             | hy_syntax::Stmt::Managed { body: block, .. } => {
@@ -876,13 +911,22 @@ impl<'a> Checker<'a> {
             hy_syntax::Stmt::For { kind, body, .. } => {
                 if matches!(kind, hy_syntax::ForKind::Infinite) {
                     let inner_flow = LoopFlow {
-                        continue_reach: false,
-                        loop_break_reach: after_reach,
+                        plain_continue_reach: false,
+                        plain_break_reach: after_reach,
+                        labeled_continue_reach: false,
+                        labeled_break_reach: after_reach,
                         select_break_reach: None,
                     };
                     Self::block_can_reach_backedge(body, false, inner_flow)
                 } else {
-                    after_reach
+                    let inner_flow = LoopFlow {
+                        plain_continue_reach: after_reach,
+                        plain_break_reach: after_reach,
+                        labeled_continue_reach: flow.labeled_continue_reach,
+                        labeled_break_reach: flow.labeled_break_reach,
+                        select_break_reach: None,
+                    };
+                    after_reach || Self::block_can_reach_backedge(body, after_reach, inner_flow)
                 }
             }
             hy_syntax::Stmt::Local(_)
@@ -925,12 +969,15 @@ impl<'a> Checker<'a> {
         }
         match stmt {
             hy_syntax::Stmt::Return { .. } => Some(false),
-            hy_syntax::Stmt::Continue { .. } => Some(flow.continue_reach),
+            hy_syntax::Stmt::Continue {
+                label: Some(_), ..
+            } => Some(flow.labeled_continue_reach),
+            hy_syntax::Stmt::Continue { label: None, .. } => Some(flow.plain_continue_reach),
             hy_syntax::Stmt::Break {
                 label: Some(_), ..
-            } => Some(flow.loop_break_reach),
+            } => Some(flow.labeled_break_reach),
             hy_syntax::Stmt::Break { label: None, .. } => {
-                Some(flow.select_break_reach.unwrap_or(flow.loop_break_reach))
+                Some(flow.select_break_reach.unwrap_or(flow.plain_break_reach))
             }
             hy_syntax::Stmt::Block { block, .. }
             | hy_syntax::Stmt::Managed { body: block, .. } => {
@@ -984,11 +1031,22 @@ impl<'a> Checker<'a> {
                 // `select` can reach the back-edge.
                 Some(Self::stmt_can_reach_backedge(stmt, after_reach, flow))
             }
-            hy_syntax::Stmt::For { body, .. } => {
+            hy_syntax::Stmt::For { kind, body, .. } => {
                 let loop_exits = Self::stmt_can_reach_backedge(stmt, after_reach, flow);
+                let is_inf = matches!(kind, hy_syntax::ForKind::Infinite);
                 let inner_flow = LoopFlow {
-                    continue_reach: loop_exits,
-                    loop_break_reach: after_reach,
+                    plain_continue_reach: loop_exits,
+                    plain_break_reach: after_reach,
+                    labeled_continue_reach: if is_inf {
+                        loop_exits
+                    } else {
+                        flow.labeled_continue_reach
+                    },
+                    labeled_break_reach: if is_inf {
+                        after_reach
+                    } else {
+                        flow.labeled_break_reach
+                    },
                     select_break_reach: None,
                 };
                 if let Some(res) =
@@ -1216,35 +1274,53 @@ impl<'a> Checker<'a> {
 }
 
 /// Does `block` contain any `continue` statement targeting the loop whose body
-/// is `block` (i.e. not enclosed in an inner `for` loop)?
-fn block_has_continue_for_loop(block: &hy_syntax::Block) -> bool {
-    block.stmts.iter().any(stmt_has_continue_for_loop)
+/// is `block`?
+fn block_has_continue_for_loop(
+    block: &hy_syntax::Block,
+    allow_plain: bool,
+    allow_labeled: bool,
+) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|s| stmt_has_continue_for_loop(s, allow_plain, allow_labeled))
 }
 
-fn stmt_has_continue_for_loop(stmt: &hy_syntax::Stmt) -> bool {
+fn stmt_has_continue_for_loop(
+    stmt: &hy_syntax::Stmt,
+    allow_plain: bool,
+    allow_labeled: bool,
+) -> bool {
     match stmt {
-        hy_syntax::Stmt::Continue { .. } => true,
+        hy_syntax::Stmt::Continue {
+            label: Some(_), ..
+        } => allow_labeled,
+        hy_syntax::Stmt::Continue { label: None, .. } => allow_plain,
         hy_syntax::Stmt::If {
             then, otherwise, ..
         } => {
-            block_has_continue_for_loop(then)
+            block_has_continue_for_loop(then, allow_plain, allow_labeled)
                 || otherwise
                     .as_deref()
-                    .map(stmt_has_continue_for_loop)
+                    .map(|o| stmt_has_continue_for_loop(o, allow_plain, allow_labeled))
                     .unwrap_or(false)
         }
-        hy_syntax::Stmt::Match { arms, .. } => {
-            arms.iter().any(|a| block_has_continue_for_loop(&a.body))
-        }
-        hy_syntax::Stmt::Select { arms, .. } => {
-            arms.iter().any(|a| block_has_continue_for_loop(&a.body))
-        }
+        hy_syntax::Stmt::Match { arms, .. } => arms
+            .iter()
+            .any(|a| block_has_continue_for_loop(&a.body, allow_plain, allow_labeled)),
+        hy_syntax::Stmt::Select { arms, .. } => arms
+            .iter()
+            .any(|a| block_has_continue_for_loop(&a.body, allow_plain, allow_labeled)),
         hy_syntax::Stmt::Block { block, .. } | hy_syntax::Stmt::Managed { body: block, .. } => {
-            block_has_continue_for_loop(block)
+            block_has_continue_for_loop(block, allow_plain, allow_labeled)
         }
-        // A `continue` (or `continue loop`, LX14) inside an inner `for` targets
-        // that inner loop, not the outer loop.
-        hy_syntax::Stmt::For { .. } => false,
+        hy_syntax::Stmt::For { kind, body, .. } => {
+            if matches!(kind, hy_syntax::ForKind::Infinite) {
+                false
+            } else {
+                allow_labeled && block_has_continue_for_loop(body, false, allow_labeled)
+            }
+        }
         _ => false,
     }
 }
