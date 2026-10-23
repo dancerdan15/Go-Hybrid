@@ -1,0 +1,9 @@
+{
+  "issue": 986,
+  "main_sha": "main000000000000",
+  "open_prs": [
+    {"number": 911, "created_at": "2026-04-01T00:00:00Z", "draft": false, "labels": [{"name": "bot:conflict"}], "mergeable": true, "head_sha": "head911000000000", "behind_by": 60},
+    {"number": 912, "created_at": "2026-04-02T00:00:00Z", "draft": false, "labels": [{"name": "bot:conflict"}], "mergeable": false, "head_sha": "head912000000000", "behind_by": 75},
+    {"number": 913, "created_at": "2026-03-01T00:00:00Z", "draft": false, "labels": [{"name": "bot:human-needed"}], "mergeable": true, "head_sha": "head913000000000", "behind_by": 80}
+  ]
+}

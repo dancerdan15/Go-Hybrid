@@ -1,0 +1,9 @@
+{
+  "issue": 986,
+  "cases": [
+    {"name": "conflict_to_land_candidate", "item": {"number": 901, "bucket": "LAND-CANDIDATE", "labels": ["bot:conflict", "bot:stale-base", "area:compiler"]}, "expected_added": ["bot:land-candidate"], "expected_removed": ["bot:conflict", "bot:stale-base"]},
+    {"name": "conflict_to_recon_unmapped", "item": {"number": 902, "bucket": "RECON", "labels": [{"name": "bot:conflict"}, {"name": "bot:land-candidate"}]}, "expected_added": [], "expected_removed": ["bot:conflict", "bot:land-candidate"]},
+    {"name": "already_synced_noop", "item": {"number": 903, "bucket": "CONFLICTS", "labels": ["bot:conflict"]}, "expected_added": [], "expected_removed": []},
+    {"name": "parked_wildcard_skipped", "item": {"number": 904, "bucket": "LAND-CANDIDATE", "wildcard_hold": true, "labels": ["bot:conflict"]}, "expected_added": [], "expected_removed": []}
+  ]
+}

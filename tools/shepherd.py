@@ -39,6 +39,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -144,28 +145,67 @@ def cmd_labels(args):
     tb.log("bot palette ensured (%d calls)" % gh.calls)
 
 
+STATE_LABEL_MAP = {
+    "LAND-CANDIDATE": "bot:land-candidate",
+    "CONFLICTS": "bot:conflict",
+    "STALE-BASE": "bot:stale-base",
+}
+
+
+def sync_item_labels(gh, it, mapping=None, dry=False):
+    if it.get("wildcard_hold") or it.get("draft_parked"):
+        return [], []
+    mapping = mapping or STATE_LABEL_MAP
+    state_labels = set(mapping.values())
+    want = mapping.get(it.get("bucket"))
+    if "labels" in it and it["labels"] is not None:
+        raw = list(it["labels"])
+        if gh is not None and not any(
+            (l.get("name", "") if isinstance(l, dict) else str(l)).startswith("bot:")
+            for l in raw
+        ):
+            raw.extend(gh.get("/repos/%s/issues/%d/labels?per_page=100"
+                              % (gh.repo, it["number"])) or [])
+    else:
+        raw = gh.get("/repos/%s/issues/%d/labels?per_page=100"
+                     % (gh.repo, it["number"])) if gh is not None else []
+    cur = {l["name"] if isinstance(l, dict) else l for l in (raw or [])}
+    stale_list = sorted((cur & state_labels) - ({want} if want else set()))
+    add_list = [want] if (want and want not in cur) else []
+    if not stale_list and not add_list:
+        return [], []
+    if dry:
+        tb.log("  #%d -> +%s -%s" % (it["number"], add_list, stale_list))
+        return add_list, stale_list
+    for stale in stale_list:
+        try:
+            gh.req("DELETE", "/repos/%s/issues/%d/labels/%s"
+                   % (gh.repo, it["number"], urllib.parse.quote(stale, safe="")))
+        except RuntimeError as e:
+            if "404" not in str(e):
+                raise
+    if add_list:
+        gh.post("/repos/%s/issues/%d/labels" % (gh.repo, it["number"]),
+                {"labels": add_list})
+    return add_list, stale_list
+
+
 def cmd_sync_labels(args):
     """Structural bot:* labels, straight from classify()'s buckets (plan §2:
-    state lives in labels; the board is a view). Idempotent POST per PR."""
+    state lives in labels; the board is a view). Reconciled both ways."""
     cfg = load_cfg()
     gh = tb.Gh(cfg["repo"], tb.load_token(args))
-    ensure_palette(gh, cfg)
+    dry = bool(getattr(args, "dry", False) or getattr(args, "dry_run", False))
+    if not dry:
+        ensure_palette(gh, cfg)
     items = json.loads(Path(args.from_scan).read_text())["items"]
-    mapping = {"LAND-CANDIDATE": "bot:land-candidate",
-               "CONFLICTS": "bot:conflict",
-               "STALE-BASE": "bot:stale-base"}
+    mapping = dict(STATE_LABEL_MAP)
     n = 0
     for it in items:
-        want = mapping.get(it["bucket"])
-        if not want or it.get("wildcard_hold") or it.get("draft_parked"):
-            continue
-        n += 1
-        if args.dry:
-            tb.log("  #%d -> %s" % (it["number"], want))
-            continue
         try:
-            gh.post("/repos/%s/issues/%d/labels" % (gh.repo, it["number"]),
-                    {"labels": [want]})
+            added, removed = sync_item_labels(gh, it, mapping, dry=dry)
+            if added or removed:
+                n += 1
         except (RuntimeError, tb.RateGuard) as e:
             tb.log("  FAIL #%d: %s" % (it["number"], e))
             if isinstance(e, tb.RateGuard):
@@ -183,11 +223,13 @@ def cmd_rebase(args):
     main_sha = gh.get("/repos/%s/commits/main" % gh.repo)["sha"]
     prs = gh.paginate("/repos/%s/pulls?state=open&per_page=100" % gh.repo)
     exempt = set(rc["exempt_labels"])
+    hard_exempt = exempt - {"bot:conflict"}
+    dry = bool(getattr(args, "dry", False) or getattr(args, "dry_run", False))
 
     cands = []
     for pr in prs:
-        labels = {l["name"] for l in pr.get("labels", [])}
-        if pr.get("draft") or (labels & exempt):
+        lbls = {l["name"] if isinstance(l, dict) else l for l in pr.get("labels", [])}
+        if pr.get("draft") or (lbls & hard_exempt):
             continue
         cands.append(pr)
     # oldest first: the most-behind branches are the most-stale ones
@@ -198,9 +240,19 @@ def cmd_rebase(args):
     scored = []
     for pr in cands[:rc["scan_window"]]:
         n = pr["number"]
+        lbls = {l["name"] if isinstance(l, dict) else l for l in pr.get("labels", [])}
         full = gh.get("/repos/%s/pulls/%d" % (gh.repo, n))
         if full.get("mergeable") is not True:
             continue  # conflicted PRs go through the W4/W5 human path, not rebase
+        if "bot:conflict" in lbls and "bot:conflict" in exempt:
+            if not dry:
+                try:
+                    gh.req("DELETE", "/repos/%s/issues/%d/labels/%s"
+                           % (gh.repo, n, urllib.parse.quote("bot:conflict", safe="")))
+                except RuntimeError as e:
+                    if "404" not in str(e):
+                        raise
+            tb.log("  #%d cleared stale bot:conflict (mergeable=True)" % n)
         cmp = gh.get("/repos/%s/compare/%s...%s" % (gh.repo, main_sha,
                                                     full["head"]["sha"]))
         behind = (cmp or {}).get("behind_by", 0) or 0
@@ -212,7 +264,7 @@ def cmd_rebase(args):
 
     todo = scored[:rc["max_per_run"]]  # 1/run @ */20 = 3/hour cap
     for behind, n, sha in todo:
-        if args.dry:
+        if dry:
             tb.log("DRY would update-branch: #%d (behind %d, expected_head_sha %s)"
                    % (n, behind, sha[:10]))
             continue
@@ -638,11 +690,11 @@ def main():
 
     p = sub.add_parser("sync-labels", help="apply structural labels from a scan")
     p.add_argument("--from-scan", required=True)
-    p.add_argument("--dry", action="store_true")
+    p.add_argument("--dry", "--dry-run", dest="dry", action="store_true")
     p.set_defaults(fn=cmd_sync_labels)
 
     p = sub.add_parser("rebase", help="W2 rebase shepherd")
-    p.add_argument("--dry", action="store_true")
+    p.add_argument("--dry", "--dry-run", dest="dry", action="store_true")
     p.set_defaults(fn=cmd_rebase)
 
     p = sub.add_parser("dup", help="W4 duplicate-cluster closer")

@@ -6,13 +6,18 @@ on. If the kill-switch matrix, the dup planner, the conflict classifier, or
 the probe parser drift, CI fails before any workflow can.
 """
 
+import json
 import re
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shepherd as sh  # noqa: E402
+
+FIXTURES_DIR = Path(__file__).resolve().parent / "tests"
 
 
 class GateMatrix(unittest.TestCase):
@@ -115,6 +120,140 @@ class ProbeParser(unittest.TestCase):
         added = list(sh.added_lines(self.DIFF))
         self.assertTrue(any(re.search(rule["pattern"], ln) for ln in added))
         self.assertFalse(any("removed line" in ln for ln in added))
+
+
+class _FakeGh:
+    def __init__(self, repo="limitlessprojects/Go-Hybrid", get_map=None,
+                 paginate_map=None, fail_delete_404=False):
+        self.repo = repo
+        self.get_map, self.paginate_map = get_map or {}, paginate_map or {}
+        self.fail_delete_404 = fail_delete_404
+        self.calls, self.remaining = 0, 4999
+        self.deleted, self.posted, self.put_calls, self.got = [], [], [], []
+
+    def get(self, path):
+        self.calls += 1
+        self.got.append(path)
+        return self.get_map.get(path)
+
+    def paginate(self, path, max_pages=10):
+        self.calls += 1
+        return list(self.paginate_map.get(path, []))
+
+    def post(self, path, payload):
+        self.calls += 1
+        self.posted.append((path, payload))
+        return 200, {}
+
+    def req(self, method, path, payload=None):
+        self.calls += 1
+        if method == "DELETE":
+            self.deleted.append(path)
+            if self.fail_delete_404:
+                raise RuntimeError("GET/POST %s -> 404: Label does not exist" % path)
+            return 204, None
+        if method == "PUT":
+            self.put_calls.append((path, payload))
+            return 202, {}
+        return 200, self.get_map.get(path)
+
+
+class StateLabelRatchet(unittest.TestCase):
+    """Issue #986: bot:conflict must not be a one-way ratchet across sync-labels
+    and W2 rebase when a PR becomes mergeable again."""
+
+    def test_sync_item_labels_fixture_matrix(self):
+        fx = json.loads((FIXTURES_DIR / "issue_986_sync_labels_ratchet_fixture.json").read_text())
+        for case in fx["cases"]:
+            with self.subTest(case=case["name"]):
+                gh = _FakeGh()
+                added, removed = sh.sync_item_labels(gh, dict(case["item"]))
+                self.assertEqual((added, removed), (case["expected_added"], case["expected_removed"]))
+                expected_del = ["/repos/%s/issues/%d/labels/%s" % (
+                    gh.repo, case["item"]["number"], lbl.replace(":", "%3A"))
+                    for lbl in case["expected_removed"]]
+                self.assertEqual(gh.deleted, expected_del)
+                expected_post = [("/repos/%s/issues/%d/labels" % (gh.repo, case["item"]["number"]),
+                                  {"labels": case["expected_added"]})] if case["expected_added"] else []
+                self.assertEqual(gh.posted, expected_post)
+
+    def test_sync_item_labels_fetches_when_labels_omitted_and_ignores_404(self):
+        gh = _FakeGh(
+            get_map={"/repos/limitlessprojects/Go-Hybrid/issues/905/labels?per_page=100": [
+                {"name": "bot:conflict"}]},
+            fail_delete_404=True,
+        )
+        it = {"number": 905, "bucket": "LAND-CANDIDATE"}
+        with patch.object(sh.tb, "log"):
+            self.assertEqual(sh.sync_item_labels(gh, it, dry=True),
+                             (["bot:land-candidate"], ["bot:conflict"]))
+        self.assertEqual((gh.deleted, gh.posted), ([], []))
+        self.assertEqual(sh.sync_item_labels(gh, it, dry=False),
+                         (["bot:land-candidate"], ["bot:conflict"]))
+        self.assertEqual(gh.deleted, [
+            "/repos/limitlessprojects/Go-Hybrid/issues/905/labels/bot%3Aconflict"])
+        self.assertEqual(gh.posted, [(
+            "/repos/limitlessprojects/Go-Hybrid/issues/905/labels",
+            {"labels": ["bot:land-candidate"]})])
+
+    def test_cmd_rebase_clears_stale_conflict_when_mergeable_true(self):
+        fx = json.loads((FIXTURES_DIR / "issue_986_rebase_stale_conflict_fixture.json").read_text())
+        repo = "limitlessprojects/Go-Hybrid"
+        get_map = {"/repos/%s/commits/main" % repo: {"sha": fx["main_sha"]}}
+        open_prs = []
+        for pr in fx["open_prs"]:
+            n = pr["number"]
+            open_prs.append({"number": n, "created_at": pr["created_at"],
+                             "draft": pr["draft"], "labels": pr["labels"]})
+            get_map["/repos/%s/pulls/%d" % (repo, n)] = {
+                "number": n, "mergeable": pr["mergeable"], "head": {"sha": pr["head_sha"]}}
+            get_map["/repos/%s/compare/%s...%s" % (repo, fx["main_sha"], pr["head_sha"])] = {
+                "behind_by": pr["behind_by"]}
+        gh = _FakeGh(repo=repo, get_map=get_map, paginate_map={
+            "/repos/%s/pulls?state=open&per_page=100" % repo: open_prs})
+        with patch.object(sh.tb, "load_token", return_value="tok"), \
+             patch.object(sh.tb, "Gh", return_value=gh), \
+             patch.object(sh.tb, "log"):
+            sh.cmd_rebase(SimpleNamespace(dry=False, token_file=None, token_env=None))
+        self.assertNotIn("/repos/%s/pulls/913" % repo, gh.got)
+        self.assertIn("/repos/%s/pulls/912" % repo, gh.got)
+        self.assertEqual(gh.deleted, ["/repos/%s/issues/911/labels/bot%%3Aconflict" % repo])
+        self.assertEqual(gh.put_calls, [("/repos/%s/pulls/911/update-branch" % repo,
+                                         {"expected_head_sha": "head911000000000"})])
+
+    def test_adversarial_red_team_vectors(self):
+        repo = "limitlessprojects/Go-Hybrid"
+        # 1. draft_parked=True + non-state labels (track:soundness, triage:unique) + TRIAGE.json triage:*-only list
+        gh = _FakeGh(get_map={
+            "/repos/%s/issues/920/labels?per_page=100" % repo: [
+                {"name": "bot:conflict"}, {"name": "track:soundness"}, {"name": "triage:unique"}]
+        })
+        self.assertEqual(sh.sync_item_labels(gh, {"number": 919, "bucket": "LAND-CANDIDATE",
+                                                  "draft_parked": True, "labels": ["bot:conflict"]}), ([], []))
+        self.assertEqual((gh.deleted, gh.posted), ([], []))
+        added, removed = sh.sync_item_labels(gh, {"number": 920, "bucket": "STALE-BASE",
+                                                  "labels": ["triage:behind", "triage:tests"]})
+        self.assertEqual((added, removed), (["bot:stale-base"], ["bot:conflict"]))
+        self.assertEqual(gh.deleted, ["/repos/%s/issues/920/labels/bot%%3Aconflict" % repo])
+        # 2. cmd_rebase with mergeable=None and dry_run=True (0 POST, 0 DELETE, 0 PUT)
+        gh_dry = _FakeGh(
+            repo=repo,
+            get_map={
+                "/repos/%s/commits/main" % repo: {"sha": "main000"},
+                "/repos/%s/pulls/921" % repo: {"number": 921, "mergeable": None, "head": {"sha": "h921"}},
+                "/repos/%s/pulls/922" % repo: {"number": 922, "mergeable": True, "head": {"sha": "h922"}},
+                "/repos/%s/compare/main000...h922" % repo: {"behind_by": 60},
+            },
+            paginate_map={"/repos/%s/pulls?state=open&per_page=100" % repo: [
+                {"number": 921, "created_at": "2026-04-01T00:00:00Z", "draft": False, "labels": [{"name": "bot:conflict"}]},
+                {"number": 922, "created_at": "2026-04-02T00:00:00Z", "draft": False, "labels": [{"name": "bot:conflict"}]},
+            ]},
+        )
+        with patch.object(sh.tb, "load_token", return_value="tok"), \
+             patch.object(sh.tb, "Gh", return_value=gh_dry), \
+             patch.object(sh.tb, "log"):
+            sh.cmd_rebase(SimpleNamespace(dry=False, dry_run=True, token_file=None, token_env=None))
+        self.assertEqual((gh_dry.deleted, gh_dry.posted, gh_dry.put_calls), ([], [], []))
 
 
 if __name__ == "__main__":
