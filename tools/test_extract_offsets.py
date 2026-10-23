@@ -2,10 +2,15 @@
 import contextlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
+
+TESTS_DIR = Path(__file__).with_name("tests")
+CASES_PATH = TESTS_DIR / "extract_offsets_cases.json"
+DWARF_FIXTURE_PATH = TESTS_DIR / "extract_offsets_dwarf_fixture.json"
 
 SPEC = importlib.util.spec_from_file_location(
     "extract_offsets", Path(__file__).with_name("extract_offsets.py")
@@ -126,6 +131,77 @@ class ExtractOffsetsTests(unittest.TestCase):
         self.assertIn("m_curg           = 24", output)
         self.assertIn("m_id             = 104", output)
         self.assertIn("m locks          = 112", output)
+
+    def test_forward_decl_and_nested_members_fixture_succeeds(self):
+        cases = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+        fixture = json.loads(DWARF_FIXTURE_PATH.read_text(encoding="utf-8"))
+        dwarf_text = "\n".join(fixture["forward_decl_and_nested_dwarf"])
+        proc = subprocess.CompletedProcess(
+            ["readelf", "--debug-dump=info", "fixture_binary"],
+            returncode=0,
+            stdout=dwarf_text,
+            stderr="",
+        )
+        stdout_buf = io.StringIO()
+        with patch.object(extractor.subprocess, "run", return_value=proc):
+            with contextlib.redirect_stdout(stdout_buf):
+                extractor.main("fixture_binary")
+        output = stdout_buf.getvalue()
+        expected = cases["expected_offsets"]
+        self.assertIn(expected["header"], output)
+        for field_name, offset in expected["fields"].items():
+            self.assertIn(f"{field_name:16} = {offset}", output)
+
+    def test_declaration_only_struct_fails(self):
+        cases = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+        dwarf_text = "\n".join(cases["declaration_only_g_dwarf"])
+        proc = subprocess.CompletedProcess(
+            ["readelf", "--debug-dump=info", "decl_only_binary"],
+            returncode=0,
+            stdout=dwarf_text,
+            stderr="",
+        )
+        stderr_buf = io.StringIO()
+        with patch.object(extractor.subprocess, "run", return_value=proc):
+            with contextlib.redirect_stderr(stderr_buf):
+                with self.assertRaises(SystemExit) as cm:
+                    extractor.main("decl_only_binary")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("FAILED: runtime.g not found in DWARF", stderr_buf.getvalue())
+
+    def test_empty_stub_before_full_definition_succeeds(self):
+        stub_prefix = (
+            " <1><050>: Abbrev Number: 1 (DW_TAG_structure_type)\n"
+            "    DW_AT_name        : runtime.g\n"
+            " <1><060>: Abbrev Number: 0\n"
+        )
+        proc = subprocess.CompletedProcess(
+            ["readelf", "--debug-dump=info", "stub_binary"],
+            returncode=0,
+            stdout=stub_prefix + VALID_DWARF_OUTPUT,
+            stderr="",
+        )
+        stdout_buf = io.StringIO()
+        with patch.object(extractor.subprocess, "run", return_value=proc):
+            with contextlib.redirect_stdout(stdout_buf):
+                extractor.main("stub_binary")
+        output = stdout_buf.getvalue()
+        self.assertIn("g_m              = 48", output)
+        self.assertIn("g_stackguard0    = 16", output)
+
+    def test_readelf_oserror_exits_cleanly(self):
+        stderr_buf = io.StringIO()
+        with patch.object(
+            extractor.subprocess,
+            "run",
+            side_effect=FileNotFoundError("No such file or directory: 'readelf'"),
+        ):
+            with contextlib.redirect_stderr(stderr_buf):
+                with self.assertRaises(SystemExit) as cm:
+                    extractor.main("any_binary")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("FAILED:", stderr_buf.getvalue())
+        self.assertIn("readelf", stderr_buf.getvalue())
 
 
 if __name__ == "__main__":

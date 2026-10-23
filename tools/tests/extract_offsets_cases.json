@@ -1,0 +1,35 @@
+{
+  "expected_offsets": {
+    "header": "# runtime.g size=376  runtime.m size=504  (from fixture_binary)",
+    "fields": {
+      "g_m": 48,
+      "g_stackguard0": 16,
+      "g_stack_lo": 0,
+      "g_stack_hi": 8,
+      "m_g0": 0,
+      "m_curg": 24,
+      "m_id": 104,
+      "m locks": 112
+    }
+  },
+  "declaration_only_g_dwarf": [
+    " <1><080>: Abbrev Number: 1 (DW_TAG_structure_type)",
+    "    DW_AT_name        : runtime.g",
+    "    DW_AT_declaration : 1",
+    " <1><200>: Abbrev Number: 2 (DW_TAG_structure_type)",
+    "    DW_AT_name        : runtime.m",
+    "    DW_AT_byte_size   : 504",
+    " <2><210>: Abbrev Number: 3 (DW_TAG_member)",
+    "    DW_AT_name        : g0",
+    "    DW_AT_data_member_location: 0",
+    " <2><220>: Abbrev Number: 3 (DW_TAG_member)",
+    "    DW_AT_name        : curg",
+    "    DW_AT_data_member_location: 24",
+    " <2><230>: Abbrev Number: 3 (DW_TAG_member)",
+    "    DW_AT_name        : id",
+    "    DW_AT_data_member_location: 104",
+    " <2><240>: Abbrev Number: 3 (DW_TAG_member)",
+    "    DW_AT_name        : locks",
+    "    DW_AT_data_member_location: 112"
+  ]
+}

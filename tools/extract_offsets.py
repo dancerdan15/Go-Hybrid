@@ -18,9 +18,13 @@ import subprocess
 import sys
 
 
-def main(binpath):
-    proc = subprocess.run(["readelf", "--debug-dump=info", binpath],
-                          capture_output=True, text=True, timeout=600)
+def run_readelf(binpath):
+    try:
+        proc = subprocess.run(["readelf", "--debug-dump=info", binpath],
+                              capture_output=True, text=True, timeout=600)
+    except OSError as exc:
+        print(f"FAILED: readelf execution error: {exc}", file=sys.stderr)
+        sys.exit(1)
     if proc.returncode != 0:
         err = proc.stderr.strip()
         msg = f"readelf failed with exit code {proc.returncode}"
@@ -28,41 +32,59 @@ def main(binpath):
             msg += f": {err}"
         print(f"FAILED: {msg}", file=sys.stderr)
         sys.exit(proc.returncode or 1)
+    return proc.stdout
 
-    out = proc.stdout
+
+def main(binpath):
+    out = run_readelf(binpath)
 
     dies = []
     cur = None
     for line in out.splitlines():
-        h = re.match(r"\s*<(\d+)><[0-9a-f]+>: Abbrev Number: \d+ \((DW_TAG_\w+)\)", line)
+        h = re.match(r"\s*<(\d+)><[0-9a-fA-F]+>: Abbrev Number: (\d+)(?: \((DW_TAG_\w+)\))?", line)
         if h:
-            cur = {"depth": int(h.group(1)), "tag": h.group(2)}
+            if h.group(3) is None:
+                cur = None
+                continue
+            cur = {"depth": int(h.group(1)), "tag": h.group(3)}
             dies.append(cur)
             continue
         if cur is None:
             continue
-        nm = re.search(r"DW_AT_name\s*:\s*(.+?)\s*$", line)
-        off = re.search(r"DW_AT_data_member_location\s*:\s*(\d+)", line)
-        sz = re.search(r"DW_AT_byte_size\s*:\s*(\d+)", line)
+        nm = re.search(r"DW_AT_name\s*:\s*(?:\([^)]*\)\s*:\s*)*(.+?)\s*$", line)
+        off = re.search(
+            r"DW_AT_data_member_location\s*:.*?\bDW_OP_plus_uconst:\s*(0x[0-9a-fA-F]+|\d+)"
+            r"|DW_AT_data_member_location\s*:\s*(0x[0-9a-fA-F]+|\d+)\s*$",
+            line,
+        )
+        sz = re.search(r"DW_AT_byte_size\s*:\s*(0x[0-9a-fA-F]+|\d+)\s*$", line)
+        decl = re.search(r"DW_AT_declaration\s*:\s*(\S+)", line)
         if nm is not None:
             cur["name"] = nm.group(1)
         if off is not None:
-            cur["off"] = int(off.group(1))
+            cur["off"] = int(off.group(1) or off.group(2), 0)
         if sz is not None:
-            cur["size"] = int(sz.group(1))
+            cur["size"] = int(sz.group(1), 0)
+        if decl is not None:
+            cur["decl"] = decl.group(1).lower() not in ("0", "0x0", "false", "no")
 
     def members_of(struct_name):
+        fallback = (None, None)
         for i, d in enumerate(dies):
             if d["tag"] == "DW_TAG_structure_type" and d.get("name") == struct_name:
+                if d.get("decl"):
+                    continue
                 base = d["depth"]
                 mem = {}
                 for e in dies[i + 1:]:
                     if e["depth"] <= base:
                         break
-                    if e["tag"] == "DW_TAG_member" and "name" in e:
+                    if e["depth"] == base + 1 and e["tag"] == "DW_TAG_member" and "name" in e:
                         mem[e["name"]] = e.get("off")
-                return d.get("size"), mem
-        return None, None
+                if mem:
+                    return d.get("size"), mem
+                fallback = (d.get("size"), mem)
+        return fallback
 
     gsize, g = members_of("runtime.g")
     msize, m = members_of("runtime.m")
