@@ -552,6 +552,7 @@ fn span_contains(outer: Span, inner: Span) -> bool {
 fn parse_nth_type_arg(name: &str, idx: usize) -> Option<TypeExpr> {
     let inner = name.get(name.find('[')? + 1..name.strip_suffix(']')?.len())?;
     let file = hy_syntax::parse_file("", &format!("fn _f() ({inner}) {{}}\n")).ok()?;
-    file.fns().next()?.results.get(idx).map(|r| r.ty.clone())
+    let ty = file.fns().next()?.results.get(idx).map(|r| r.ty.clone());
+    ty
 }
 

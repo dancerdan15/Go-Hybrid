@@ -1,6 +1,7 @@
 //! Regression tests for Issue #765 (`HYB-E2002` / T23): multi-value return
 //! arity checking for single-type-arg generic function and method calls,
-//! generic struct `fn` fields, and local method / generic function values.
+//! generic struct `fn` fields, and local method / generic function values
+//! (bound method values are the primary fix).
 
 use hy_check::{check_file, CheckResult, Verdict};
 use hy_diag::Severity;
@@ -28,6 +29,9 @@ fn assert_accepts(src: &str) {
     assert_eq!(r.verdict, Verdict::Accept);
 }
 
+// Regression guard: these single-type-arg generic fn/method call cases are
+// already rejected with HYB-E2002 on main (via `base_named_type_str` and the
+// method path); this test pins that so the resolver changes do not regress it.
 #[test]
 fn single_type_arg_generic_fn_and_method_calls_reject_e2002() {
     assert_rejects_e2002(
