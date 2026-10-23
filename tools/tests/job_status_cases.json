@@ -1,0 +1,78 @@
+{
+  "parse_cases": [
+    {
+      "name": "legacy_quoted_running",
+      "output": "jackblessed/go-hybrid-worker has status \"KernelWorkerStatus.RUNNING\"",
+      "expected": "RUNNING"
+    },
+    {
+      "name": "legacy_quoted_complete",
+      "output": "jackblessed/go-hybrid-worker has status \"KernelWorkerStatus.COMPLETE\"",
+      "expected": "COMPLETE"
+    },
+    {
+      "name": "unquoted_enum_running",
+      "output": "jackblessed/go-hybrid-worker has status KernelWorkerStatus.RUNNING",
+      "expected": "RUNNING"
+    },
+    {
+      "name": "unquoted_enum_complete",
+      "output": "jackblessed/go-hybrid-worker has status KernelWorkerStatus.COMPLETE",
+      "expected": "COMPLETE"
+    },
+    {
+      "name": "unquoted_lowercase_complete",
+      "output": "jackblessed/go-hybrid-worker has status complete",
+      "expected": "COMPLETE"
+    },
+    {
+      "name": "unquoted_lowercase_running",
+      "output": "jackblessed/go-hybrid-worker has status running",
+      "expected": "RUNNING"
+    },
+    {
+      "name": "unquoted_lowercase_queued",
+      "output": "jackblessed/go-hybrid-worker has status queued",
+      "expected": "QUEUED"
+    },
+    {
+      "name": "unquoted_lowercase_error",
+      "output": "jackblessed/go-hybrid-worker has status error",
+      "expected": "ERROR"
+    },
+    {
+      "name": "unquoted_lowercase_cancelled",
+      "output": "jackblessed/go-hybrid-worker has status cancelled",
+      "expected": "CANCELLED"
+    },
+    {
+      "name": "multiline_warning_then_unquoted_complete",
+      "output": "Warning: Your Kaggle API key is readable by other users.\njackblessed/go-hybrid-worker has status complete\n",
+      "expected": "COMPLETE"
+    },
+    {
+      "name": "quoted_rate_limit_error_is_ignored",
+      "output": "429 Too Many Requests: \"rate limit exceeded\"",
+      "expected": "?"
+    },
+    {
+      "name": "quoted_state_word_in_error_is_ignored",
+      "output": "Error: \"COMPLETE\" failure while contacting server",
+      "expected": "?"
+    },
+    {
+      "name": "empty_output",
+      "output": "",
+      "expected": "?"
+    }
+  ],
+  "invalid_slugs": [
+    "",
+    "   ",
+    "-h",
+    "--help",
+    "-p",
+    " --version",
+    "owner/kernel\n--help"
+  ]
+}

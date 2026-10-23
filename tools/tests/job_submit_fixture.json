@@ -1,0 +1,37 @@
+{
+  "valid_job": {
+    "job": "ci-smoke-check",
+    "commands": [
+      {
+        "name": "unit",
+        "run": "python3 -m unittest"
+      }
+    ]
+  },
+  "invalid_jobs": [
+    {
+      "name": "not_an_object_list",
+      "payload": ["not", "a", "dict"]
+    },
+    {
+      "name": "missing_job_key",
+      "payload": {"commands": []}
+    },
+    {
+      "name": "empty_job_key",
+      "payload": {"job": "   ", "commands": []}
+    },
+    {
+      "name": "non_string_job_key",
+      "payload": {"job": 42, "commands": []}
+    },
+    {
+      "name": "non_list_commands",
+      "payload": {"job": "demo", "commands": "invalid"}
+    },
+    {
+      "name": "secret_in_payload",
+      "payload": {"job": "demo", "token": "KAGGLE_KEY=secret"}
+    }
+  ]
+}

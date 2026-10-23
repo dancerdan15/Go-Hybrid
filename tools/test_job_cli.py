@@ -589,5 +589,132 @@ class KaggleFetchFreshnessTests(unittest.TestCase):
                 list((root / "result" / "raw").glob(".staging-*")), [])
 
 
+class KaggleStatusParserAndSlugTests(unittest.TestCase):
+    FIXTURE_PATH = Path(__file__).parent / "tests" / "job_status_cases.json"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = json.loads(cls.FIXTURE_PATH.read_text(encoding="utf-8"))
+
+    def test_parse_kaggle_status_fixture_cases(self):
+        for case in self.fixture["parse_cases"]:
+            with self.subTest(name=case["name"]):
+                self.assertEqual(
+                    JOB.parse_kaggle_status(case["output"]),
+                    case["expected"],
+                )
+
+    def test_kaggle_wait_recognizes_unquoted_status_transitions(self):
+        polls = iter([
+            (0, "owner/kernel has status KernelWorkerStatus.QUEUED"),
+            (0, "429 Too Many Requests: \"rate limit exceeded\""),
+            (0, "owner/kernel has status complete"),
+        ])
+        with patch.object(JOB, "sh", side_effect=lambda *a, **kw: next(polls)), \
+                patch.object(JOB.time, "sleep"), \
+                patch("sys.stdout", new=io.StringIO()):
+            rc = JOB.kaggle_wait(1, slug="owner/kernel")
+        self.assertEqual(rc, 0)
+
+    def test_kaggle_wait_unquoted_error_and_cancelled_return_one(self):
+        for terminal_line in (
+            "owner/kernel has status KernelWorkerStatus.ERROR",
+            "owner/kernel has status cancelled",
+        ):
+            with self.subTest(terminal_line=terminal_line):
+                polls = iter([
+                    (0, "owner/kernel has status running"),
+                    (0, terminal_line),
+                ])
+                with patch.object(JOB, "sh", side_effect=lambda *a, **kw: next(polls)), \
+                        patch.object(JOB.time, "sleep"), \
+                        patch("sys.stdout", new=io.StringIO()):
+                    rc = JOB.kaggle_wait(1, slug="owner/kernel")
+                self.assertEqual(rc, 1)
+
+    def test_slug_guard_rejects_flag_injection_and_blank_slugs(self):
+        for bad_slug in self.fixture["invalid_slugs"]:
+            with self.subTest(slug=bad_slug):
+                with tempfile.TemporaryDirectory() as td, \
+                        patch.object(JOB, "sh") as mock_sh:
+                    with self.assertRaises(SystemExit):
+                        JOB.validate_slug(bad_slug)
+                    with self.assertRaises(SystemExit):
+                        JOB.kaggle_status(bad_slug)
+                    with self.assertRaises(SystemExit):
+                        JOB.kaggle_wait(1, bad_slug)
+                    with self.assertRaises(SystemExit):
+                        JOB.kaggle_fetch(td, slug=bad_slug)
+                    mock_sh.assert_not_called()
+                    self.assertFalse((Path(td) / "result").exists())
+
+
+class KaggleSubmitPrePushValidationTests(unittest.TestCase):
+    FIXTURE_PATH = Path(__file__).parent / "tests" / "job_submit_fixture.json"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = json.loads(cls.FIXTURE_PATH.read_text(encoding="utf-8"))
+
+    def test_invalid_job_payloads_abort_before_file_mutation_or_push(self):
+        for case in self.fixture["invalid_jobs"]:
+            with self.subTest(name=case["name"]), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                worker = root / "worker"
+                worker.mkdir()
+                script = worker / "script.py"
+                pristine = (JOB.INJECT_MARKER + "\n").encode("utf-8")
+                script.write_bytes(pristine)
+                jobdir = root / "job"
+                jobdir.mkdir()
+                (jobdir / "job.json").write_text(
+                    json.dumps(case["payload"]), encoding="utf-8"
+                )
+                with patch.object(JOB, "WORKER_DIR", str(worker)), \
+                        patch.object(JOB, "resolve_head", return_value="a" * 40), \
+                        patch.object(JOB, "sh") as mock_sh:
+                    with self.assertRaises(SystemExit):
+                        JOB.kaggle_submit(str(jobdir))
+                mock_sh.assert_not_called()
+                self.assertEqual(script.read_bytes(), pristine)
+                self.assertFalse((worker / "job.json").exists())
+                self.assertFalse((jobdir / "submitted.json").exists())
+
+    def test_inject_marker_replaces_only_first_occurrence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = root / "worker"
+            worker.mkdir()
+            script = worker / "script.py"
+            template = (
+                JOB.INJECT_MARKER + "\n"
+                "LITERAL_MARKER = " + repr(JOB.INJECT_MARKER) + "\n"
+            )
+            script.write_text(template, encoding="utf-8")
+            jobdir = root / "job"
+            jobdir.mkdir()
+            (jobdir / "job.json").write_text(
+                json.dumps(self.fixture["valid_job"]), encoding="utf-8"
+            )
+            captured = []
+
+            def fake_sh(cmd, **kwargs):
+                if "kernels push" in cmd:
+                    captured.append(script.read_text(encoding="utf-8"))
+                return 0, "ok"
+
+            with patch.object(JOB, "WORKER_DIR", str(worker)), \
+                    patch.object(JOB, "resolve_head", return_value="b" * 40), \
+                    patch.object(JOB, "sh", side_effect=fake_sh), \
+                    patch("sys.stdout", new=io.StringIO()):
+                JOB.kaggle_submit(str(jobdir))
+            self.assertEqual(len(captured), 1)
+            self.assertIn(
+                "LITERAL_MARKER = " + repr(JOB.INJECT_MARKER),
+                captured[0],
+            )
+            self.assertEqual(script.read_text(encoding="utf-8"), template)
+
+
 if __name__ == "__main__":
     unittest.main()

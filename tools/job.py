@@ -78,20 +78,55 @@ def resolve_head():
 
 
 def kaggle_slug():
-    with open(META) as f:
-        return json.load(f)["id"]
+    with open(META, encoding="utf-8") as f:
+        meta = json.load(f)
+    if not isinstance(meta, dict):
+        sys.exit("REFUSING invalid kernel-metadata.json: must be a JSON object")
+    return validate_slug(meta.get("id"))
+
+
+SECRET_PATTERNS = ("ghp_", "gho_", "github_pat_", "KGAT_", "KAGGLE_KEY")
+
+
+def validate_slug(slug):
+    if not isinstance(slug, str) or not slug.strip():
+        sys.exit("REFUSING invalid Kaggle kernel slug: must be a non-empty string")
+    if slug.lstrip().startswith("-"):
+        sys.exit("REFUSING invalid Kaggle kernel slug {!r}: must not start with '-'".format(slug))
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in slug):
+        sys.exit("REFUSING invalid Kaggle kernel slug: control characters are not allowed")
+    return slug
+
+
+def validate_job_payload(job):
+    if not isinstance(job, dict):
+        sys.exit("REFUSING to push: job.json must be a JSON object")
+    job_name = job.get("job")
+    if not isinstance(job_name, str) or not job_name.strip():
+        sys.exit("REFUSING to push: job.json must contain a non-empty string 'job' field")
+    if "commands" in job and not isinstance(job["commands"], list):
+        sys.exit("REFUSING to push: job.json 'commands' field must be a list")
+    serialized = json.dumps(job)
+    for pat in SECRET_PATTERNS:
+        if pat in serialized:
+            sys.exit("REFUSING to push: secret pattern {} in job.json".format(pat))
+    return job
 
 
 # ---------------------------------------------------------------- kaggle tier
 def kaggle_submit(jobdir):
+    try:
+        with open(os.path.join(jobdir, "job.json"), encoding="utf-8") as f:
+            job = json.load(f)
+    except (OSError, ValueError) as exc:
+        sys.exit("REFUSING to push: invalid job.json: {}".format(exc))
+    validate_job_payload(job)
     head = resolve_head()
-    with open(os.path.join(jobdir, "job.json")) as f:
-        job = json.load(f)
     job["sha"] = head  # run the code we just pushed
     payload = json.dumps(job, indent=2)
 
     # sanity: no secrets in the payload
-    for pat in ("ghp_", "gho_", "github_pat_", "KGAT_", "KAGGLE_KEY"):
+    for pat in SECRET_PATTERNS:
         if pat in payload:
             sys.exit("REFUSING to push: secret pattern {} in job.json".format(pat))
 
@@ -101,7 +136,7 @@ def kaggle_submit(jobdir):
     src = original_script.decode("utf-8")
     if INJECT_MARKER not in src:
         sys.exit("worker/script.py missing inject marker")
-    injected = src.replace(INJECT_MARKER, "JOB_JSON = " + repr(payload))
+    injected = src.replace(INJECT_MARKER, "JOB_JSON = " + repr(payload), 1)
     sidecar = os.path.join(WORKER_DIR, "job.json")
     try:
         with open(sidecar, "rb") as f:
@@ -137,14 +172,37 @@ def kaggle_submit(jobdir):
 
 
 def kaggle_status(slug=None):
-    slug = slug or kaggle_slug()
+    slug = validate_slug(slug) if slug is not None else kaggle_slug()
     rc, out = sh("{} kernels status {}".format(shlex.quote(KAGGLE_CLI), shlex.quote(slug)), timeout=60)
     print(out)
     return out
 
 
-TERMINAL_STATES = ("COMPLETE", "ERROR", "CANCELACKNOWLEDGED", "CANCELEDEXECUTION")
+TERMINAL_STATES = (
+    "COMPLETE",
+    "ERROR",
+    "CANCELACKNOWLEDGED",
+    "CANCELEDEXECUTION",
+    "CANCELLED",
+    "CANCELED",
+)
 ACTIVE_STATES = ("QUEUED", "RUNNING", "CANCELREQUESTED")
+KNOWN_STATES = frozenset(TERMINAL_STATES + ACTIVE_STATES)
+_STATUS_RE = re.compile(
+    r"(?:\bhas\s+status\s+[\"']?(?:KernelWorkerStatus\.)?([A-Za-z_]+)(?![A-Za-z0-9_-])[\"']?"
+    r"|\bKernelWorkerStatus\.([A-Za-z_]+)(?![A-Za-z0-9_-]))",
+    re.IGNORECASE,
+)
+
+
+def parse_kaggle_status(output: str) -> str:
+    if not isinstance(output, str):
+        return "?"
+    for match in reversed(list(_STATUS_RE.finditer(output))):
+        candidate = (match.group(1) or match.group(2) or "").upper()
+        if candidate in KNOWN_STATES:
+            return candidate
+    return "?"
 
 
 def kaggle_wait(minutes, slug=None):
@@ -158,17 +216,14 @@ def kaggle_wait(minutes, slug=None):
 
     Exit codes: 0 = COMPLETE, 1 = kernel error/cancel, 2 = timeout.
     """
-    slug = slug or kaggle_slug()
+    slug = validate_slug(slug) if slug is not None else kaggle_slug()
     deadline = time.time() + minutes * 60
     saw_active = False
     state, polls = "?", 0
     while time.time() < deadline:
         rc, out = sh("{} kernels status {}".format(shlex.quote(KAGGLE_CLI), shlex.quote(slug)), timeout=60)
         polls += 1
-        try:
-            state = out.split('"')[-2].split(".")[-1].upper()  # '"KernelWorkerStatus.RUNNING"'
-        except IndexError:
-            state = "?"  # CLI error text: keep polling, do not trust
+        state = parse_kaggle_status(out) if rc == 0 else "?"
         print("[poll {}] {}".format(polls, state), flush=True)
         if state in ACTIVE_STATES:
             saw_active = True
@@ -199,7 +254,7 @@ def kaggle_fetch(jobdir, slug=None):
     Returns 0 on success, 1 when nothing was promoted (the documented
     exit-code contract; the raw CLI status is reported in the message).
     """
-    slug = slug or kaggle_slug()
+    slug = validate_slug(slug) if slug is not None else kaggle_slug()
     raw = os.path.join(jobdir, "result", "raw")
     os.makedirs(raw, exist_ok=True)
     try:
