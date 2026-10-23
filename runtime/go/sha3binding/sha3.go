@@ -16,6 +16,9 @@ var (
 )
 
 func init() {
+	if FnDigest256 == nil || FnStreamChecksum == nil || FnAbiWord == nil {
+		panic(ErrABI.Error())
+	}
 	// SMALL class (guard 1024, row 4): the abi-word probe is a constant
 	// return — zero recursion, zero heap, a handful of bytes of frame.
 	if w := hybridge.Cross1S(FnAbiWord, 0); w != abiWordExpected {
@@ -34,6 +37,7 @@ func init() {
 func Digest256(data []byte) ([]byte, error) {
 	out := make([]byte, 32)
 	var p runtime.Pinner
+	defer p.Unpin()
 	var dataPtr uintptr
 	if len(data) > 0 {
 		dataPtr = uintptr(unsafe.Pointer(&data[0]))
@@ -45,8 +49,6 @@ func Digest256(data []byte) ([]byte, error) {
 	// input-proportional stack (interfaces/descriptors.md sha3 rows).
 	st := hybridge.Cross3S(FnDigest256, dataPtr, uintptr(len(data)),
 		uintptr(unsafe.Pointer(&out[0])))
-	p.Unpin()
-	runtime.KeepAlive(&p)
 	runtime.KeepAlive(data)
 	runtime.KeepAlive(out)
 	if st != 0 {

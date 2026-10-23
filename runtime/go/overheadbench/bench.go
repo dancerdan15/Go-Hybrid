@@ -44,7 +44,13 @@ var (
 const abiWordExpected = 0x68795f61626931 // "hy_abi1"
 
 func init() {
-	if w := hybridge.Cross1(FnAbiWord, 0); w != abiWordExpected {
+	if FnNop == nil || FnAbiWord == nil || FnAlign == nil {
+		panic("overheadbench: unresolved hyrt C-ABI symbol address")
+	}
+	// SMALL class (guard 1024, row 4): the abi-word probe is a constant
+	// return — zero recursion, zero heap, and must not dirty DeepPathCount
+	// on a fresh 2 KiB init goroutine stack before benchmark loops begin.
+	if w := hybridge.Cross1S(FnAbiWord, 0); w != abiWordExpected {
 		panic("overheadbench: hyrt ABI handshake mismatch (rebuild the runtime)")
 	}
 }
@@ -55,6 +61,12 @@ func init() {
 // deep-path retry is Cross1's internal concern, unchanged from spike 3.
 func Nop(x uint64) uint64 {
 	return hybridge.Cross1(FnNop, uintptr(x))
+}
+
+// NopS crosses the boundary via the SMALL-class trampoline (1024 B guard,
+// row 4) — the tiny-callee fast path eligible on shallow goroutine stacks.
+func NopS(x uint64) uint64 {
+	return hybridge.Cross1S(FnNop, uintptr(x))
 }
 
 // NopRaw — the G2 bench's diagnostic: the fast trampoline with NO Go
@@ -72,3 +84,12 @@ func NopRaw(x uint64) (uint64, bool) {
 // DeepPathCount reports how many crossings took the deep path (cold-path
 // counter — the bench reads it after each loop to prove the fast path).
 func DeepPathCount() uint64 { return hybridge.DeepPathCount.Load() }
+
+// DeepCrossCount reports how many crossings took the always-deep route
+// (CrossDeep1..4 — the class-ledger DEEP class).
+func DeepCrossCount() uint64 { return hybridge.DeepCrossCount.Load() }
+
+// StackAlignmentProbe crosses into hyrt_stack_alignment_probe via the
+// SMALL-class fast trampoline and returns a 16-byte-aligned local's address
+// mod 16 (0 when the callee frame satisfies the 16-byte ABI contract).
+func StackAlignmentProbe() uint64 { return hybridge.Cross1S(FnAlign, 0) }
