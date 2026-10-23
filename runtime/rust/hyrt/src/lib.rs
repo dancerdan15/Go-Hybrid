@@ -107,8 +107,13 @@ pub extern "C" fn hyrt_stack_alignment_probe() -> u64 {
 use serde_json::{Map, Value as Json};
 use std::sync::Mutex;
 
+struct Slot {
+    gen: u32,
+    val: Option<Json>,
+}
+
 struct Table {
-    slots: Vec<Option<(u32, Json)>>, // (generation, value); None = free
+    slots: Vec<Slot>,
     free: Vec<usize>,
 }
 
@@ -120,6 +125,14 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 const ERR_TABLE: i32 = 1; // table poisoned / slot invalid
 const ERR_JSON: i32 = 2; // the JSON operation itself failed
 
+fn next_gen(g: u32) -> u32 {
+    if g == u32::MAX {
+        1
+    } else {
+        g + 1
+    }
+}
+
 fn handle_pack(idx: usize, gen: u32) -> u64 {
     ((gen as u64) << 32) | (idx as u64 + 1)
 }
@@ -129,9 +142,12 @@ fn handle_unpack(h: u64) -> Option<(usize, u32)> {
     if h == 0 || h == u64::MAX {
         return None;
     }
-    let idx = (h & 0xFFFF_FFFF) as usize - 1;
+    let raw_idx = (h & 0xFFFF_FFFF) as usize;
     let gen = (h >> 32) as u32;
-    Some((idx, gen))
+    if raw_idx == 0 || gen == 0 {
+        return None;
+    }
+    Some((raw_idx - 1, gen))
 }
 
 fn with_table(f: impl FnOnce(&mut Table) -> Result<(), i32>) -> i32 {
@@ -145,33 +161,32 @@ fn with_table(f: impl FnOnce(&mut Table) -> Result<(), i32>) -> i32 {
 }
 
 fn table_insert(t: &mut Table, v: Json) -> u64 {
-    let gen = 1u32;
     if let Some(idx) = t.free.pop() {
-        t.slots[idx] = Some((gen, v));
+        let gen = t.slots[idx].gen;
+        t.slots[idx].val = Some(v);
         return handle_pack(idx, gen);
     }
-    t.slots.push(Some((gen, v)));
+    let gen = 1u32;
+    t.slots.push(Slot { gen, val: Some(v) });
     handle_pack(t.slots.len() - 1, gen)
 }
 
 fn table_get(t: &Table, h: u64) -> Result<&Json, i32> {
     let (idx, gen) = handle_unpack(h).ok_or(ERR_TABLE)?;
     let slot = t.slots.get(idx).ok_or(ERR_TABLE)?;
-    let (g, v) = slot.as_ref().ok_or(ERR_TABLE)?;
-    if *g != gen {
+    if slot.gen != gen {
         return Err(ERR_TABLE); // stale generation: INVALID, never corrupt
     }
-    Ok(v)
+    slot.val.as_ref().ok_or(ERR_TABLE)
 }
 
 fn table_get_mut(t: &mut Table, h: u64) -> Result<&mut Json, i32> {
     let (idx, gen) = handle_unpack(h).ok_or(ERR_TABLE)?;
     let slot = t.slots.get_mut(idx).ok_or(ERR_TABLE)?;
-    let (g, v) = slot.as_mut().ok_or(ERR_TABLE)?;
-    if *g != gen {
+    if slot.gen != gen {
         return Err(ERR_TABLE);
     }
-    Ok(v)
+    slot.val.as_mut().ok_or(ERR_TABLE)
 }
 
 /// A C-ABI string view: (ptr, len) — Go pins the backing bytes for the call.
@@ -394,16 +409,29 @@ pub extern "C" fn hy_json_set(v: u64, kptr: u64, klen: u64, value: u64) -> i32 {
         Err(e) => return e,
     };
     with_table(|t| {
-        // Remove the value from the table (ownership MOVES into v).
+        // Validate both `value` (live handle) and `v` (distinct live JSON Object)
+        // before removing `value` from the table so a failed `Set` never consumes `value`.
         let (vidx, vgen) = handle_unpack(value).ok_or(ERR_TABLE)?;
+        let (tidx, tgen) = handle_unpack(v).ok_or(ERR_TABLE)?;
+        if vidx == tidx {
+            return Err(ERR_TABLE);
+        }
         {
-            let slot = t.slots.get_mut(vidx).ok_or(ERR_TABLE)?;
-            let (g, _) = slot.as_ref().ok_or(ERR_TABLE)?;
-            if *g != vgen {
+            let vslot = t.slots.get(vidx).ok_or(ERR_TABLE)?;
+            if vslot.val.is_none() || vslot.gen != vgen {
                 return Err(ERR_TABLE);
             }
+            let tslot = t.slots.get(tidx).ok_or(ERR_TABLE)?;
+            if tslot.gen != tgen {
+                return Err(ERR_TABLE);
+            }
+            let tobj = tslot.val.as_ref().ok_or(ERR_TABLE)?;
+            if !tobj.is_object() {
+                return Err(ERR_JSON);
+            }
         }
-        let (_, val) = t.slots[vidx].take().ok_or(ERR_TABLE)?;
+        let val = t.slots[vidx].val.take().ok_or(ERR_TABLE)?;
+        t.slots[vidx].gen = next_gen(t.slots[vidx].gen);
         t.free.push(vidx);
         let obj = table_get_mut(t, v)?.as_object_mut().ok_or(ERR_JSON)?;
         obj.insert(k, val);
@@ -419,7 +447,7 @@ pub extern "C" fn hy_json_value_text(v: u64, out: *mut u8, cap: usize, out_len: 
         return ERR_TABLE;
     }
     let mut status = 0i32;
-    with_table(|t| {
+    let rc = with_table(|t| {
         let text = table_get(t, v)?.to_string();
         let need = text.len();
         unsafe {
@@ -434,7 +462,11 @@ pub extern "C" fn hy_json_value_text(v: u64, out: *mut u8, cap: usize, out_len: 
         }
         Ok(())
     });
-    status
+    if rc != 0 {
+        rc
+    } else {
+        status
+    }
 }
 
 /// `serde_json.to_string_pretty(v)` — same buffer protocol, pretty form.
@@ -449,7 +481,7 @@ pub extern "C" fn hy_json_to_string_pretty(
         return ERR_TABLE;
     }
     let mut status = 0i32;
-    with_table(|t| {
+    let rc = with_table(|t| {
         let text = serde_json::to_string_pretty(table_get(t, v)?).map_err(|_| ERR_JSON)?;
         let need = text.len();
         unsafe {
@@ -464,7 +496,11 @@ pub extern "C" fn hy_json_to_string_pretty(
         }
         Ok(())
     });
-    status
+    if rc != 0 {
+        rc
+    } else {
+        status
+    }
 }
 
 /// Release a handle (idempotent; stale generations read INVALID). Go calls
@@ -474,11 +510,10 @@ pub extern "C" fn hy_json_release(h: u64) -> i32 {
     with_table(|t| {
         if let Some((idx, gen)) = handle_unpack(h) {
             if let Some(slot) = t.slots.get_mut(idx) {
-                if let Some((g, _)) = slot.as_ref() {
-                    if *g == gen {
-                        *slot = None;
-                        t.free.push(idx);
-                    }
+                if slot.val.is_some() && slot.gen == gen {
+                    slot.val = None;
+                    slot.gen = next_gen(slot.gen);
+                    t.free.push(idx);
                 }
             }
         }
@@ -493,7 +528,7 @@ pub extern "C" fn hy_json_live_count(out: *mut u64) -> i32 {
         return ERR_TABLE;
     }
     with_table(|t| {
-        let live = t.slots.iter().filter(|s| s.is_some()).count();
+        let live = t.slots.iter().filter(|s| s.val.is_some()).count();
         unsafe {
             *out = live as u64;
         }
