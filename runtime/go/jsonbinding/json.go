@@ -41,20 +41,33 @@ var (
 // Value is a Rust-owned JSON value handle. Zero id = released/moved.
 type Value struct{ h *handle }
 
-type handle struct{ id uint64 }
+type handle struct {
+	id      uint64
+	cleanup runtime.Cleanup
+}
 
 func wrap(id uint64) Value {
 	h := &handle{id: id}
-	// Late release is safe (hyrt's release is idempotent + generation-
-	// checked); a MOVED value zeroes its id first, so this releases nothing.
 	// DEEP class: drop recurses on the value tree; cleanup goroutines run
 	// on arbitrary stacks.
-	runtime.AddCleanup(h, func(id uint64) {
-		if id != 0 {
+	if id != 0 {
+		h.cleanup = runtime.AddCleanup(h, func(id uint64) {
 			hybridge.CrossDeep1(FnRelease, uintptr(id))
-		}
-	}, id)
+		}, id)
+	}
 	return Value{h: h}
+}
+
+// Release drops v's underlying Rust handle and stops its GC cleanup.
+func (v Value) Release() {
+	if v.h == nil || v.h.id == 0 {
+		return
+	}
+	v.h.cleanup.Stop()
+	id := v.h.id
+	v.h.id = 0
+	hybridge.CrossDeep1(FnRelease, uintptr(id))
+	runtime.KeepAlive(v.h)
 }
 
 // pinCrossKey: the copy-small pinned borrow for a key/string argument.
@@ -119,16 +132,26 @@ func (v Value) Array(key string) ([]Value, error) {
 	pin.Unpin()
 	runtime.KeepAlive(pin)
 	runtime.KeepAlive(kb)
+	runtime.KeepAlive(v.h)
 	if st != statusOK {
 		return nil, ErrJSON
 	}
 	var n uint64
-	hybridge.Cross2S(FnArrayLen, uintptr(arrID), uintptr(unsafe.Pointer(&n))) // SMALL: len read
+	if hybridge.Cross2S(FnArrayLen, uintptr(arrID), uintptr(unsafe.Pointer(&n))) != statusOK { // SMALL: len read
+		hybridge.CrossDeep1(FnRelease, uintptr(arrID))
+		return nil, ErrJSON
+	}
 	out := make([]Value, n)
 	for i := range out {
 		var eid uint64
 		// DEEP class: elem.clone() recurses on the element's nesting.
-		hybridge.CrossDeep3(FnArrayGet, uintptr(arrID), uintptr(i), uintptr(unsafe.Pointer(&eid)))
+		if hybridge.CrossDeep3(FnArrayGet, uintptr(arrID), uintptr(i), uintptr(unsafe.Pointer(&eid))) != statusOK {
+			for _, el := range out[:i] {
+				el.Release()
+			}
+			hybridge.CrossDeep1(FnRelease, uintptr(arrID))
+			return nil, ErrJSON
+		}
 		out[i] = wrap(eid)
 	}
 	// The temporary array handle dies with the materialized slice.
@@ -149,6 +172,7 @@ func (v Value) Int(key string) (int64, error) {
 	pin.Unpin()
 	runtime.KeepAlive(pin)
 	runtime.KeepAlive(kb)
+	runtime.KeepAlive(v.h)
 	if st != statusOK {
 		return 0, ErrJSON
 	}
@@ -169,6 +193,7 @@ func (v Value) String(key string) (string, error) {
 	pin.Unpin()
 	runtime.KeepAlive(pin)
 	runtime.KeepAlive(kb)
+	runtime.KeepAlive(v.h)
 	if st != statusOK {
 		return "", ErrJSON
 	}
@@ -187,6 +212,7 @@ func (v Value) PushString(s string) error {
 	pin.Unpin()
 	runtime.KeepAlive(pin)
 	runtime.KeepAlive(sb)
+	runtime.KeepAlive(v.h)
 	if st != statusOK {
 		return ErrJSON
 	}
@@ -197,7 +223,7 @@ func (v Value) PushString(s string) error {
 // takes any Go scalar: a Value handle moves directly; bool/int/float/string
 // box through a JSON round-trip (Marshal produces the exact JSON text, Parse
 // allocates the Rust-side handle, set moves it in — the temp's late cleanup
-// releases nothing because the move zeroes its id). Set reports the Rust
+// is stopped when the move zeroes its id). Set reports the Rust
 // status (hy_json_set's i32) as an error — `doc.set(k, v)?` propagates it.
 func (v Value) Set(key string, val any) error {
 	if hv, ok := val.(Value); ok {
@@ -211,7 +237,11 @@ func (v Value) Set(key string, val any) error {
 	if err != nil {
 		return err
 	}
-	return v.setHandle(key, bv)
+	if err := v.setHandle(key, bv); err != nil {
+		bv.Release()
+		return err
+	}
+	return nil
 }
 
 func (v Value) setHandle(key string, val Value) error {
@@ -225,9 +255,12 @@ func (v Value) setHandle(key string, val Value) error {
 	pin.Unpin()
 	runtime.KeepAlive(pin)
 	runtime.KeepAlive(kb)
+	runtime.KeepAlive(v.h)
+	runtime.KeepAlive(val.h)
 	if st != statusOK {
 		return ErrJSON
 	}
+	val.h.cleanup.Stop()
 	val.h.id = 0 // moved: the handle's payload now lives inside v
 	return nil
 }
@@ -241,6 +274,7 @@ func ToStringPretty(v Value) (string, error) {
 	var need uint64
 	// DEEP class: serialize walks the value tree (see ledger).
 	st := hybridge.CrossDeep4(FnToStringPretty, uintptr(v.h.id), 0, 0, uintptr(unsafe.Pointer(&need)))
+	runtime.KeepAlive(v.h)
 	if st == statusTryAgain && need > 0 {
 		buf := make([]byte, need)
 		var p runtime.Pinner
@@ -250,6 +284,7 @@ func ToStringPretty(v Value) (string, error) {
 		p.Unpin()
 		runtime.KeepAlive(&p)
 		runtime.KeepAlive(buf)
+		runtime.KeepAlive(v.h)
 		if st == statusOK {
 			return string(buf[:need]), nil
 		}
