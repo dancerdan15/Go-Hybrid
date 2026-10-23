@@ -5,8 +5,8 @@
 // A jsonbinding.Value is a generation-tagged handle (u64 = (gen<<32)|(idx+1))
 // into hyrt's owning-side table. Go never touches JSON memory; every method
 // crosses through the trampolines. Release runs via runtime.AddCleanup when
-// the wrapper becomes unreachable; a MOVED value (Set's argument) has its id
-// zeroed first, so the late cleanup releases nothing (idempotent anyway).
+// the wrapper becomes unreachable, or explicitly via Value.Release; a MOVED
+// value (Set's argument) has its cleanup stopped and its id zeroed.
 //
 // Key strings cross as the pinned-borrow protocol: []byte(key) copy →
 // pin → cross → unpin + KeepAlive (copy-small; keys are small).

@@ -65,8 +65,7 @@ func TestDeepNestingParsesViaDeepPath(t *testing.T) {
 	}
 	// Explicit release through the DEEP route (the leak canary asserts zero
 	// live objects across the suite; zeroing the id alone would leak this one).
-	hybridge.CrossDeep1(FnRelease, uintptr(v.h.id))
-	v.h.id = 0
+	v.Release()
 }
 
 // TestDeepNestingOnConstrainedStack: the same worst case, executed on a
@@ -111,8 +110,7 @@ func TestDeepNestingOnConstrainedStack(t *testing.T) {
 			done <- errors.New("absent key must error")
 			return
 		}
-		hybridge.CrossDeep1(FnRelease, uintptr(v.h.id))
-		v.h.id = 0
+		v.Release()
 		done <- nil
 	}()
 	if err := <-done; err != nil {
