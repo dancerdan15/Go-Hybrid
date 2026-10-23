@@ -79,10 +79,6 @@ def _mask_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
-_MANAGED_HEADER_RE = re.compile(r"(?<!\.)\bmanaged\s*\([\s,]*\)\s*\{")
-_NON_STMT_PREFIX_RE = re.compile(r"(?:\.|\bfn(?:\s*\([^)]*\))?)\s*$")
-
-
 def _norm_prog(path: str) -> str:
     if os.path.splitdrive(path)[0]:
         return os.path.normpath(path)
@@ -94,8 +90,7 @@ def scan_managed_lines(src: str) -> list[int]:
     masked = _mask_comments_and_strings(src)
     return [
         1 + masked.count("\n", 0, m.start())
-        for m in _MANAGED_HEADER_RE.finditer(masked)
-        if not _NON_STMT_PREFIX_RE.search(masked, 0, m.start())
+        for m in re.finditer(r"\bmanaged\s*\(", masked)
     ]
 
 
