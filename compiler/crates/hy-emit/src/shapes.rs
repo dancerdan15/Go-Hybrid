@@ -63,6 +63,29 @@ const fn method(go: &'static str, result: Option<&'static str>) -> Member {
     }
 }
 
+const SERDE_JSON_MEMBERS: &[(&str, Member)] = &[
+    ("array", method("Array", Some("serde_json.value"))),
+    ("int", method("Int", None)),
+    ("string", method("String", None)),
+    ("get", method("Get", Some("serde_json.value"))),
+    ("set", method("Set", None)),
+    ("set_int", method("SetInt", None)),
+    ("set_bool", method("SetBool", None)),
+    ("push_string", method("PushString", None)),
+    ("remove", method("Remove", None)),
+    ("to_string_pretty", method("ToStringPretty", None)),
+    ("release", method("Release", None)),
+];
+
+const SYNC_RWMUTEX_MEMBERS: &[(&str, Member)] = &[
+    ("lock", method("Lock", None)),
+    ("unlock", method("Unlock", None)),
+    ("try_lock", method("TryLock", None)),
+    ("rlock", method("RLock", None)),
+    ("runlock", method("RUnlock", None)),
+    ("try_rlock", method("TryRLock", None)),
+];
+
 /// A foreign type's member table, keyed by the hy type name
 /// (`http.request` — dotted, snake_case, exactly as the surface spells it).
 pub struct TypeShape {
@@ -175,18 +198,14 @@ pub static SHAPES: &[(&str, TypeShape)] = &[
         TypeShape { members: &[] },
     ),
     (
-        // 05: methods on a serde_json handle value (all Methods — Go's
+        // 05: methods on a serde_json handle value / view (all Methods — Go's
         // binding spells them as value-receiver calls).
         "serde_json.value",
-        TypeShape {
-            members: &[
-                ("array", method("Array", None)),
-                ("int", method("Int", None)),
-                ("string", method("String", None)),
-                ("set", method("Set", None)),
-                ("push_string", method("PushString", None)),
-            ],
-        },
+        TypeShape { members: SERDE_JSON_MEMBERS },
+    ),
+    (
+        "serde_json.view",
+        TypeShape { members: SERDE_JSON_MEMBERS },
     ),
     (
         // 18: sync.Mutex — value methods on a user-struct field
@@ -203,15 +222,26 @@ pub static SHAPES: &[(&str, TypeShape)] = &[
     (
         // sync.RWMutex rides along for the pool family (rlock/runlock).
         "sync.rwmutex",
+        TypeShape { members: SYNC_RWMUTEX_MEMBERS },
+    ),
+    (
+        "sync.rw_mutex",
+        TypeShape { members: SYNC_RWMUTEX_MEMBERS },
+    ),
+    (
+        "sync.wait_group",
         TypeShape {
             members: &[
-                ("lock", method("Lock", None)),
-                ("unlock", method("Unlock", None)),
-                ("try_lock", method("TryLock", None)),
-                ("rlock", method("RLock", None)),
-                ("runlock", method("RUnlock", None)),
-                ("try_rlock", method("TryRLock", None)),
+                ("add", method("Add", None)),
+                ("done", method("Done", None)),
+                ("wait", method("Wait", None)),
             ],
+        },
+    ),
+    (
+        "sync.once",
+        TypeShape {
+            members: &[("do", method("Do", None))],
         },
     ),
     (
@@ -302,8 +332,25 @@ pub static METHOD_RESULTS: &[(&str, &str, (u8, bool))] = &[
     ("serde_json.value", "array", (1, true)),
     ("serde_json.value", "int", (1, true)),
     ("serde_json.value", "string", (1, true)),
+    ("serde_json.value", "get", (1, true)),
+    ("serde_json.value", "to_string_pretty", (1, true)),
     ("serde_json.value", "set", (0, true)),
+    ("serde_json.value", "set_int", (0, true)),
+    ("serde_json.value", "set_bool", (0, true)),
+    ("serde_json.value", "remove", (0, true)),
     ("serde_json.value", "push_string", (0, true)),
+    ("serde_json.value", "release", (0, false)),
+    ("serde_json.view", "array", (1, true)),
+    ("serde_json.view", "int", (1, true)),
+    ("serde_json.view", "string", (1, true)),
+    ("serde_json.view", "get", (1, true)),
+    ("serde_json.view", "to_string_pretty", (1, true)),
+    ("serde_json.view", "set", (0, true)),
+    ("serde_json.view", "set_int", (0, true)),
+    ("serde_json.view", "set_bool", (0, true)),
+    ("serde_json.view", "remove", (0, true)),
+    ("serde_json.view", "push_string", (0, true)),
+    ("serde_json.view", "release", (0, false)),
 ];
 
 pub fn lookup_method_results(ty: &str, name: &str) -> Option<(u8, bool)> {
@@ -500,6 +547,9 @@ pub static RUST_CRATES: &[RustCrateDesc] = &[
 pub static RUST_TYPES: &[(&str, &str, &str)] = &[
     // (hy type, binding root, Go type)
     ("serde_json.value", "jsonbinding", "Value"),
+    ("serde_json.view", "jsonbinding", "Value"),
+    ("sync.rw_mutex", "sync", "RWMutex"),
+    ("sync.rwmutex", "sync", "RWMutex"),
 ];
 
 pub fn lookup_rust_type(hy_ty: &str) -> Option<(&'static str, &'static str)> {
