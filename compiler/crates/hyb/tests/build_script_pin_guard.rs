@@ -1,5 +1,6 @@
 //! Integration tests for `compiler/crates/hyb/build.rs` pin normalization,
-//! Cargo rerun directives, and fail-open `rustc --version` probing.
+//! Cargo rerun directives, fail-open `rustc --version` probing, and the
+//! mismatch refusal.
 
 use std::fs;
 use std::path::PathBuf;
@@ -42,7 +43,7 @@ impl Harness {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "rustc".to_string());
         for (src, bin) in [(BUILD_RS, &build_bin), (fake_rustc_src.to_str().unwrap(), &fake_rustc_bin)] {
-            let status = Command::new(&rustc).arg(src).arg("-o").arg(bin).status().expect("compile helper");
+            let status = Command::new(&rustc).args(["--edition", "2021"]).arg(src).arg("-o").arg(bin).status().expect("compile helper");
             assert!(status.success(), "compiling {src} must succeed");
         }
         Self { root, build_bin, fake_rustc_bin }
@@ -52,7 +53,6 @@ impl Harness {
         let mut cmd = Command::new(&self.build_bin);
         cmd.env_remove("HYB_PINNED_RUST")
             .env_remove("HYB_PINNED_GO")
-            .env_remove("HYB_ALLOW_TOOLCHAIN_DRIFT")
             .env("RUSTC", &self.fake_rustc_bin)
             .env("FAKE_RUSTC_STDOUT", rustc_stdout)
             .env("FAKE_RUSTC_EXIT", rustc_exit.to_string());
@@ -76,7 +76,6 @@ fn emits_rerun_directives_and_passes_when_rustc_matches_default_pin() {
     for expected in [
         "cargo:rerun-if-env-changed=HYB_PINNED_RUST",
         "cargo:rerun-if-env-changed=HYB_PINNED_GO",
-        "cargo:rerun-if-env-changed=HYB_ALLOW_TOOLCHAIN_DRIFT",
         "cargo:rerun-if-env-changed=RUSTC",
         "cargo:rerun-if-changed=build.rs",
         "cargo:rustc-env=HYB_PINNED_RUST=1.99.0",
@@ -139,4 +138,19 @@ fn skips_guard_when_rustc_probe_fails_or_emits_non_version_output() {
         "missing RUSTC binary must skip the guard, stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn refuses_mismatched_rustc_with_diagnostic() {
+    let h = Harness::new();
+    let out = h.run(&[], "rustc 1.85.0 (4d91de4e4 2025-02-17)\n", 0);
+    assert!(!out.status.success(), "mismatched rustc must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for needle in [
+        "=== HYB pin drift guard (HYB-E9001, build time) ===",
+        "rustc `1.85.0` while baking the pin `1.99.0`",
+        "HYB_PINNED_RUST=1.85.0 cargo build",
+    ] {
+        assert!(stderr.contains(needle), "missing `{needle}` in stderr:\n{stderr}");
+    }
 }

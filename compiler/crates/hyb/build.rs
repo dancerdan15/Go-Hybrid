@@ -32,10 +32,6 @@ fn resolve_pinned_rust(raw: Option<&str>) -> String {
         .to_string()
 }
 
-fn allow_toolchain_drift(raw: Option<&str>) -> bool {
-    raw.map(str::trim) == Some("1")
-}
-
 fn parse_rustc_version(stdout: &str) -> Option<&str> {
     stdout.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("rustc ")?;
@@ -52,16 +48,11 @@ fn main() {
     // Fix the stale-bake half: an override change must invalidate the build.
     println!("cargo:rerun-if-env-changed=HYB_PINNED_RUST");
     println!("cargo:rerun-if-env-changed=HYB_PINNED_GO");
-    println!("cargo:rerun-if-env-changed=HYB_ALLOW_TOOLCHAIN_DRIFT");
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=build.rs");
 
     let pin = resolve_pinned_rust(std::env::var("HYB_PINNED_RUST").ok().as_deref());
     println!("cargo:rustc-env=HYB_PINNED_RUST={pin}");
-
-    if allow_toolchain_drift(std::env::var("HYB_ALLOW_TOOLCHAIN_DRIFT").ok().as_deref()) {
-        return;
-    }
 
     // Which rustc is compiling THIS crate? Cargo sets RUSTC for build
     // scripts; fall back to PATH lookup, and if neither yields a version,
