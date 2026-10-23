@@ -766,8 +766,9 @@ impl Expr {
                 operand,
                 ..
             } => operand.root_ident(),
-            Expr::Paren { inner, .. } => inner.root_ident(),
-            Expr::Try { operand, .. } => operand.root_ident(),
+            Expr::Paren { inner, .. }
+            | Expr::Try { operand: inner, .. }
+            | Expr::Move { operand: inner, .. } => inner.root_ident(),
             _ => None,
         }
     }
@@ -777,24 +778,27 @@ impl Expr {
     /// Distinguished from a slice-of-arrays literal `[][N]T{…}` by the
     /// array `TypeExpr` sharing the literal's opening `[` source position.
     pub fn as_array_lit(&self) -> Option<(Option<&Expr>, &TypeExpr, &TypeExpr)> {
-        if let Expr::SliceLit {
-            elem: Some(t),
-            span,
-            ..
-        } = self
-        {
-            if let TypeExpr::Array {
-                len,
-                elem,
-                span: ty_span,
-            } = t.as_ref()
-            {
-                if ty_span.start == span.start {
-                    return Some((len.as_deref(), elem.as_ref(), t.as_ref()));
+        match self {
+            Expr::Paren { inner, .. } | Expr::Move { operand: inner, .. } => inner.as_array_lit(),
+            Expr::SliceLit {
+                elem: Some(t),
+                span,
+                ..
+            } => {
+                if let TypeExpr::Array {
+                    len,
+                    elem,
+                    span: ty_span,
+                } = t.as_ref()
+                {
+                    if ty_span.start == span.start {
+                        return Some((len.as_deref(), elem.as_ref(), t.as_ref()));
+                    }
                 }
+                None
             }
+            _ => None,
         }
-        None
     }
 
     /// Render for diagnostics (short, lossy, never panics).
