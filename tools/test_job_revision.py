@@ -119,9 +119,13 @@ class _FakeGh:
                 mb_sha = spec.split("...", 1)[0]
                 if self.mb_delay:
                     time.sleep(self.mb_delay)
+                if mb_sha not in self.cmp_mb_by_sha:
+                    raise AssertionError("unexpected merge_base compare: %s" % path)
                 return dict(self.cmp_mb_by_sha[mb_sha])
             spec = path.split("/compare/", 1)[1]
             head_sha = spec.split("...", 1)[1]
+            if head_sha not in self.cmp_head_by_sha:
+                raise AssertionError("unexpected main...head compare: %s" % path)
             return dict(self.cmp_head_by_sha[head_sha])
         raise AssertionError("unexpected get path: %s" % path)
 
@@ -142,60 +146,84 @@ class TriageBotQuotaAndTestPatternsTests(unittest.TestCase):
             pr["base"] = {"sha": base_sha}
         return pr
 
-    def test_collect_skips_compare_when_base_equals_main_sha(self):
+    def test_collect_skips_compare_only_when_head_equals_main_sha(self):
         main_sha = "m" * 40
-        prs, full_by_num, files_by_num = [], {}, {}
-        for i in range(1, 51):
-            head_sha = main_sha if i == 50 else "%040x" % i
-            # Mix PRs having base.sha on list item, only on full PR, or stale list base vs fresh full base
-            base_on_list = main_sha if i % 3 == 1 else ("0" * 40 if i % 3 == 2 else None)
-            prs.append(self._mk_pr(i, head_sha, base_sha=base_on_list))
-            full_by_num[i] = None if i == 50 else {
-                "mergeable": True,
-                "mergeable_state": "clean",
-                "base": {"sha": main_sha},
-            }
+        old_mb = "1" * 40
+        prs, full_by_num, files_by_num, cmp_head = [], {}, {}, {}
+        # PRs 1..9: head == main_sha -> the only safe shortcut, no compare at all.
+        for i in range(1, 10):
+            prs.append(self._mk_pr(i, main_sha, base_sha=main_sha))
+            full_by_num[i] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": main_sha}}
             files_by_num[i] = [{"filename": "tools/triage_bot.py", "additions": 5, "deletions": 1}]
+        # Regression: branch cut from an old main, but base.sha is already the
+        # fresh main tip (== main_sha). behind_by must come from main...head.
+        for i in range(10, 20):
+            head_sha = "%040x" % i
+            prs.append(self._mk_pr(i, head_sha, base_sha=main_sha))
+            full_by_num[i] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": main_sha}}
+            files_by_num[i] = [{"filename": "tools/triage_bot.py", "additions": 5, "deletions": 1}]
+            cmp_head[head_sha] = {
+                "status": "diverged",
+                "ahead_by": 2,
+                "behind_by": 40,
+                "merge_base_commit": {"sha": old_mb},
+            }
+        cmp_mb = {old_mb: {"status": "ahead", "ahead_by": 40, "behind_by": 0,
+                           "files": [{"filename": "tools/triage_bot.py"}, {"filename": "README.md"}]}}
 
-        gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, {}, {})
+        gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, cmp_head, cmp_mb)
         args = type("Args", (), {"jobs": 6})()
         with contextlib.redirect_stdout(io.StringIO()):
             items, got_main = tb.collect(tb.load_cfg(), gh, args)
 
         self.assertEqual(got_main, main_sha)
-        self.assertEqual(len(items), 50)
-        self.assertEqual(gh.compare_calls, [])
-        for it in items:
-            self.assertEqual(it["behind_by"], 0)
-            self.assertEqual(it["overlap_risk"], [])
+        self.assertEqual(len(items), 19)
+        head_compares = [c for c in gh.compare_calls if not c.endswith("?per_page=250")]
+        self.assertEqual(
+            sorted(head_compares),
+            sorted("/repos/%s/compare/%s...%040x" % (gh.repo, main_sha, i) for i in range(10, 20)),
+        )
+        by_num = {it["number"]: it for it in items}
+        for i in range(1, 10):
+            self.assertEqual(by_num[i]["behind_by"], 0)
+            self.assertEqual(by_num[i]["overlap_risk"], [])
+        for i in range(10, 20):
+            self.assertEqual(by_num[i]["behind_by"], 40)
+            self.assertEqual(by_num[i]["overlap_risk"], ["tools/triage_bot.py"])
 
     def test_collect_caches_shared_merge_base_compare_across_concurrent_workers(self):
         main_sha = "a" * 40
-        stale_base = "b" * 40
-        prs, full_by_num, files_by_num = [], {}, {}
+        shared_mb = "b" * 40
+        prs, full_by_num, files_by_num, cmp_head = [], {}, {}, {}
         for i in range(1, 11):
             head_sha = "%040x" % (100 + i)
-            prs.append(self._mk_pr(i, head_sha, base_sha=stale_base))
-            full_by_num[i] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": stale_base}}
+            prs.append(self._mk_pr(i, head_sha, base_sha=shared_mb))
+            full_by_num[i] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": shared_mb}}
             touched = "tools/triage_bot.py" if i % 2 == 0 else "README.md"
             files_by_num[i] = [{"filename": touched, "additions": 10, "deletions": 2}]
+            cmp_head[head_sha] = {
+                "status": "diverged",
+                "ahead_by": 1,
+                "behind_by": 4,
+                "merge_base_commit": {"sha": shared_mb},
+            }
         cmp_mb = {
-            stale_base: {
+            shared_mb: {
                 "status": "ahead",
                 "ahead_by": 4,
                 "behind_by": 0,
                 "files": [{"filename": "tools/triage_bot.py"}, {"filename": "tools/shepherd.py"}],
             }
         }
-        gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, {}, cmp_mb, mb_delay=0.02)
+        gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, cmp_head, cmp_mb, mb_delay=0.02)
         args = type("Args", (), {"jobs": 6})()
         with contextlib.redirect_stdout(io.StringIO()):
             items, _ = tb.collect(tb.load_cfg(), gh, args)
 
-        self.assertEqual(
-            gh.compare_calls,
-            ["/repos/%s/compare/%s...%s?per_page=250" % (gh.repo, stale_base, main_sha)],
-        )
+        mb_calls = [c for c in gh.compare_calls if c.endswith("?per_page=250")]
+        head_calls = [c for c in gh.compare_calls if not c.endswith("?per_page=250")]
+        self.assertEqual(mb_calls, ["/repos/%s/compare/%s...%s?per_page=250" % (gh.repo, shared_mb, main_sha)])
+        self.assertEqual(len(head_calls), 10)
         by_num = {it["number"]: it for it in items}
         for i in range(1, 11):
             self.assertEqual(by_num[i]["behind_by"], 4)
@@ -204,66 +232,51 @@ class TriageBotQuotaAndTestPatternsTests(unittest.TestCase):
             else:
                 self.assertEqual(by_num[i]["overlap_risk"], [])
 
-    def test_collect_diverged_status_fallback_computes_behind_by_from_merge_base(self):
+    def test_collect_behind_by_comes_from_main_head_compare_not_stale_base(self):
         main_sha = "c" * 40
-        div_base = "d" * 40
-        real_mb = "f" * 40
+        stale_base = "d" * 40
+        mb_7 = "f" * 40
+        mb_600 = "9" * 40
+        mb_div0 = "8" * 40
+        touched = [{"filename": "tools/triage_bot.py", "additions": 3, "deletions": 1}]
         prs, full_by_num, files_by_num, cmp_head = [], {}, {}, {}
-        for i in (1, 2):
-            head_sha = "%040x" % (200 + i)
-            prs.append(self._mk_pr(i, head_sha, base_sha=div_base))
-            full_by_num[i] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": div_base}}
-            files_by_num[i] = [{"filename": "tools/triage_bot.py", "additions": 3, "deletions": 1}]
-        # Also include a 3rd PR with no base.sha that falls back to main...head compare
-        head_3 = "%040x" % 203
-        prs.append(self._mk_pr(3, head_3, base_sha=None))
-        full_by_num[3] = {"mergeable": True, "mergeable_state": "clean"}
-        files_by_num[3] = [{"filename": "tools/triage_bot.py", "additions": 3, "deletions": 1}]
-        cmp_head[head_3] = {
-            "status": "diverged",
-            "behind_by": 0,
-            "merge_base_commit": {"sha": real_mb},
-        }
-        # PR #4: ancient PR (behind_by=600 > overlap_window=100) must NOT fetch merge_base...main_sha
-        head_4 = "%040x" % 204
-        prs.append(self._mk_pr(4, head_4, base_sha=None))
-        full_by_num[4] = {"mergeable": False, "mergeable_state": "dirty"}
-        files_by_num[4] = [{"filename": "tools/triage_bot.py", "additions": 3, "deletions": 1}]
-        cmp_head[head_4] = {
-            "status": "behind",
-            "behind_by": 600,
-            "merge_base_commit": {"sha": "9" * 40},
-        }
+        heads = {n: "%040x" % (200 + n) for n in (1, 2, 3, 4)}
+        for n, head_sha in heads.items():
+            # every PR carries the same stale base.sha (main is 20 commits ahead of it)
+            prs.append(self._mk_pr(n, head_sha, base_sha=stale_base))
+            full_by_num[n] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": stale_base}}
+            files_by_num[n] = list(touched)
+        # (a) head already merged main: behind_by 0 despite the stale base, no merge_base compare
+        cmp_head[heads[1]] = {"status": "ahead", "ahead_by": 3, "behind_by": 0,
+                              "merge_base_commit": {"sha": main_sha}}
+        # (b) diverged, behind_by 7: overlap from the merge_base...main path list
+        cmp_head[heads[2]] = {"status": "diverged", "ahead_by": 2, "behind_by": 7,
+                              "merge_base_commit": {"sha": mb_7}}
+        # (c) behind_by 600 > overlap_window: no merge_base compare for this merge_base
+        cmp_head[heads[3]] = {"status": "diverged", "ahead_by": 1, "behind_by": 600,
+                              "merge_base_commit": {"sha": mb_600}}
+        # (d) "diverged" with behind_by 0: stays 0, never overwritten from a merge_base compare
+        cmp_head[heads[4]] = {"status": "diverged", "ahead_by": 1, "behind_by": 0,
+                              "merge_base_commit": {"sha": mb_div0}}
         cmp_mb = {
-            div_base: {
-                "status": "diverged",
-                "ahead_by": 0,
-                "behind_by": 2,
-                "merge_base_commit": {"sha": real_mb},
-                "files": None,
-            },
-            real_mb: {
-                "status": "ahead",
-                "ahead_by": 7,
-                "behind_by": 0,
-                "files": [{"filename": "tools/triage_bot.py"}],
-            },
+            mb_7: {"status": "ahead", "ahead_by": 7, "behind_by": 0,
+                   "files": [{"filename": "tools/triage_bot.py"}]},
         }
         gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, cmp_head, cmp_mb)
         args = type("Args", (), {"jobs": 2})()
         with contextlib.redirect_stdout(io.StringIO()):
             items, _ = tb.collect(tb.load_cfg(), gh, args)
 
-        mb_compare_calls = [
-            c for c in gh.compare_calls
-            if c == "/repos/%s/compare/%s...%s?per_page=250" % (gh.repo, real_mb, main_sha)
-        ]
-        self.assertEqual(len(mb_compare_calls), 1)
+        mb_calls = [c for c in gh.compare_calls if c.endswith("?per_page=250")]
+        self.assertEqual(mb_calls, ["/repos/%s/compare/%s...%s?per_page=250" % (gh.repo, mb_7, main_sha)])
         by_num = {it["number"]: it for it in items}
-        for n in (1, 2, 3):
-            self.assertEqual(by_num[n]["behind_by"], 7)
-            self.assertEqual(by_num[n]["overlap_risk"], ["tools/triage_bot.py"])
-        self.assertEqual(by_num[4]["behind_by"], 600)
+        self.assertEqual(by_num[1]["behind_by"], 0)
+        self.assertEqual(by_num[1]["overlap_risk"], [])
+        self.assertEqual(by_num[2]["behind_by"], 7)
+        self.assertEqual(by_num[2]["overlap_risk"], ["tools/triage_bot.py"])
+        self.assertEqual(by_num[3]["behind_by"], 600)
+        self.assertEqual(by_num[3]["overlap_risk"], [])
+        self.assertEqual(by_num[4]["behind_by"], 0)
         self.assertEqual(by_num[4]["overlap_risk"], [])
 
     def test_has_test_file_and_classify_tests_included_alignment(self):
@@ -305,7 +318,19 @@ class TriageBotQuotaAndTestPatternsTests(unittest.TestCase):
             full_by_num[5000 + idx] = {"mergeable": True, "mergeable_state": "clean", "base": {"sha": main_sha}}
             files_by_num[5000 + idx] = [{"filename": path, "additions": 20, "deletions": 2}]
 
-        gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, {}, {})
+        # heads differ from main_sha, so every PR gets a main...head compare;
+        # behind_by 0 with merge_base == main_sha keeps classify on the
+        # behind_by == 0 branch (+1), so the expected scores are unchanged.
+        cmp_head = {
+            pr["head"]["sha"]: {
+                "status": "ahead",
+                "ahead_by": 1,
+                "behind_by": 0,
+                "merge_base_commit": {"sha": main_sha},
+            }
+            for pr in prs
+        }
+        gh = _FakeGh(main_sha, prs, full_by_num, files_by_num, cmp_head, {})
         args = type("Args", (), {"jobs": 4})()
         cfg = tb.load_cfg()
         with contextlib.redirect_stdout(io.StringIO()):
