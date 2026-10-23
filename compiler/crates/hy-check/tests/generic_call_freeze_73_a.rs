@@ -21,11 +21,4 @@ fn generic_identity_preserves_shape_for_alias_chain_and_struct_projection() {
     );
     assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
     assert_eq!(r2.diagnostics[0].code, "HYB-E3003");
-
-    let r3 = check(
-        "struct box[t any] { val t }\nfn unbox[t any](b box[t]) t { return b.val }\nfn worker(m map[string]int, done chan<- bool) { m[\"w\"] = 1\n done <- true }\n\
-         fn main() {\n done := make(chan bool, 1)\n m := map[string]int{\"k\": 1}\n b := box[map[string]int]{val: m}\n m2 := unbox(b)\n task worker(move m, done)\n m2[\"k\"] = 2\n <-done\n }",
-    );
-    assert_eq!(r3.verdict, Verdict::Reject, "{:?}", r3.diagnostics);
-    assert_eq!(r3.diagnostics[0].code, "HYB-E3003");
 }

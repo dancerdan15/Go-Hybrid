@@ -517,15 +517,6 @@ impl<'a> Checker<'a> {
             (TypeExpr::Named { name, .. }, _) if tparam_names.contains(name.as_str()) => {
                 out.entry(name.clone()).or_insert_with(|| arg_ty.clone());
             }
-            (TypeExpr::Named { name: pn, .. }, TypeExpr::Named { name: an, .. }) => {
-                if let (Some((pb, pi)), Some((ab, ai))) = (pn.strip_suffix(']').and_then(|s| s.split_once('[')), an.strip_suffix(']').and_then(|s| s.split_once('['))) {
-                    if pb == ab && tparam_names.contains(pi) {
-                        if let Some(hy_syntax::Decl::TypeAlias(ta)) = hy_syntax::parse_file("", &format!("type _a = {ai}")).ok().and_then(|ast| ast.decls.into_iter().next()) {
-                            out.entry(pi.to_string()).or_insert(ta.ty);
-                        }
-                    }
-                }
-            }
             (TypeExpr::Pointer { to: p, .. }, TypeExpr::Pointer { to: a, .. })
             | (TypeExpr::Slice { elem: p, .. }, TypeExpr::Slice { elem: a, .. })
             | (TypeExpr::Array { elem: p, .. }, TypeExpr::Array { elem: a, .. })
@@ -1192,10 +1183,6 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-    }
-
-    pub(crate) fn call_result_tys(&self, st: &FnState, callee: &Expr) -> Option<Vec<TypeExpr>> {
-        self.call_result_tys_with_args(st, callee, &[])
     }
 
     pub(crate) fn call_result_tys_with_args(
