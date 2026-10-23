@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import random
 import subprocess
 import sys
@@ -11,6 +12,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import hyfuzz
+
+TESTS_DIR = Path(__file__).resolve().parents[1] / "tests"
+HYFUZZ_CASES = json.loads((TESTS_DIR / "hyfuzz_cases.json").read_text(encoding="utf-8"))
+HYFUZZ_FIXTURE = json.loads((TESTS_DIR / "hyfuzz_fixture.json").read_text(encoding="utf-8"))
+REAL_RUN = subprocess.run
 
 
 class FuzzProcessTests(unittest.TestCase):
@@ -105,15 +111,23 @@ class FuzzArtifactTests(unittest.TestCase):
         self.corpus.mkdir()
         (self.corpus / "sample.hy").write_text("fn main() {}", encoding="utf-8")
         self.source = "// full reproduction \u65e5\u672c\u8a9e\n" + "x " * 200 + "TAIL_MARKER\n"
-        self.checker = self.root / "checker"
-        self.checker.write_text(
+        self.checker_script = self.root / "checker"
+        self.checker_script.write_text(
             "#!" + sys.executable + "\n"
             "from pathlib import Path\nimport sys\n"
             "source = Path(sys.argv[2]).read_text(encoding='utf-8')\n"
             "sys.exit(23 if source.endswith('TAIL_MARKER\\n') else 0)\n",
             encoding="utf-8",
         )
-        self.checker.chmod(0o755)
+        self.checker_script.chmod(0o755)
+        if os.name == "nt":
+            self.checker = self.root / "checker.cmd"
+            self.checker.write_text(
+                f'@"{sys.executable}" "{self.checker_script}" %*\n',
+                encoding="utf-8",
+            )
+        else:
+            self.checker = self.checker_script
         self.destination = self.root / "failures"
 
     def invoke(self, destination=True, source=None):
@@ -260,6 +274,102 @@ class FuzzInputValidationTests(unittest.TestCase):
             ]), patch.object(hyfuzz, "check_one", return_value=(None, True)):
                 # Returns cleanly without exiting with error
                 hyfuzz.main()
+
+    def test_non_executable_hyb_fails_closed_with_exit_2(self):
+        with tempfile.TemporaryDirectory() as root:
+            hyb_file = Path(root, "not_exec_hyb")
+            hyb_file.write_text("not an executable", encoding="utf-8")
+            hyb_file.chmod(0o644)
+            corpus = Path(root, "corpus")
+            corpus.mkdir()
+            (corpus / "case.hy").write_text("fn main() {}", encoding="utf-8")
+            failures_dir = Path(root, "failures")
+            stderr = io.StringIO()
+            with patch.object(sys, "argv", [
+                "hyfuzz.py", "--hyb", str(hyb_file), "--corpus", str(corpus),
+                "--cases", "5", "--failures-dir", str(failures_dir),
+            ]), patch.object(hyfuzz.os, "access", return_value=False), \
+                    patch.object(hyfuzz, "check_one") as check_mock, \
+                    contextlib.redirect_stderr(stderr), \
+                    self.assertRaises(SystemExit) as failure:
+                hyfuzz.main()
+            self.assertEqual(failure.exception.code, HYFUZZ_FIXTURE["config_error_exit_code"])
+            self.assertIn("not executable", stderr.getvalue())
+            self.assertEqual(check_mock.call_count, 0)
+            self.assertFalse(failures_dir.exists())
+
+    def test_load_corpus_skips_directories_and_replaces_invalid_utf8(self):
+        with tempfile.TemporaryDirectory() as corpus:
+            root = Path(corpus)
+            for entry in HYFUZZ_FIXTURE["corpus_entries"]:
+                target = root / entry["name"]
+                if entry["type"] == "dir":
+                    target.mkdir()
+                else:
+                    target.write_bytes(bytes.fromhex(entry["hex_bytes"]))
+            loaded = hyfuzz.load_corpus(corpus)
+            self.assertEqual(len(loaded), HYFUZZ_FIXTURE["expected_loaded_count"])
+            self.assertTrue(any("\ufffd" in item for item in loaded))
+
+    def test_corpus_with_only_hy_directory_exits_2(self):
+        with tempfile.TemporaryDirectory() as corpus:
+            Path(corpus, "only_dir.hy").mkdir()
+            stderr = io.StringIO()
+            with patch.object(sys, "argv", [
+                "hyfuzz.py", "--hyb", sys.executable, "--corpus", corpus, "--cases", "1",
+            ]), contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as failure:
+                hyfuzz.main()
+            self.assertEqual(failure.exception.code, HYFUZZ_FIXTURE["config_error_exit_code"])
+            self.assertIn("no corpus programs found", stderr.getvalue())
+
+    def test_check_one_handles_non_utf8_process_output_and_timeout_bytes(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            helper = Path(workdir, "emit_bytes.py")
+            for case in HYFUZZ_CASES["non_utf8_outputs"]:
+                with self.subTest(case=case["name"]):
+                    helper.write_text(
+                        "import sys\n"
+                        f"sys.{case['stream']}.buffer.write(bytes.fromhex({case['hex_bytes']!r}))\n"
+                        f"sys.{case['stream']}.buffer.flush()\n"
+                        f"raise SystemExit({case['returncode']})\n",
+                        encoding="utf-8",
+                    )
+                    with patch.object(
+                        hyfuzz.subprocess, "run",
+                        side_effect=lambda cmd, **kw: REAL_RUN(
+                            [sys.executable, str(helper), *cmd[1:]], **kw
+                        ),
+                    ):
+                        bad, accepted = hyfuzz.check_one("hyb", "fn main() {}", workdir, 2)
+                    if "expected_failure_prefix" in case:
+                        self.assertIsNotNone(bad)
+                        self.assertTrue(bad.startswith(case["expected_failure_prefix"]))
+                    else:
+                        self.assertEqual(bad, case["expected_failure"])
+                    self.assertEqual(accepted, case["expected_accepted"])
+
+            timeout_exc = subprocess.TimeoutExpired("hyb", 1, output=b"\xff\xfe", stderr=b"\x80\x81")
+            with patch.object(hyfuzz.subprocess, "run", side_effect=timeout_exc):
+                self.assertEqual(hyfuzz.check_one("hyb", "fn main() {}", workdir, 1), ("HANG", False))
+
+    def test_early_stop_reports_actual_executed_cases(self):
+        cfg = HYFUZZ_CASES["early_stop"]
+        with tempfile.TemporaryDirectory() as corpus:
+            Path(corpus, "case.hy").write_text("fn main() {}", encoding="utf-8")
+            stdout = io.StringIO()
+            with patch.object(sys, "argv", [
+                "hyfuzz.py", "--hyb", sys.executable, "--corpus", corpus,
+                "--cases", str(cfg["requested_cases"]), "--seed", str(cfg["seed"]),
+            ]), patch.object(
+                hyfuzz, "check_one", return_value=("UNEXPECTED exit=2", False),
+            ) as check_mock, contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as failure:
+                hyfuzz.main()
+            self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(check_mock.call_count, cfg["expected_executed"])
+            self.assertIn(
+                f"hyfuzz: {cfg['expected_executed']} cases, seed={cfg['seed']}, clean-rejects=0, clean-accepts=0",
+                stdout.getvalue(),
+            )
 
 
 if __name__ == "__main__":

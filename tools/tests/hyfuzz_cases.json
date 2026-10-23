@@ -1,0 +1,33 @@
+{
+  "non_utf8_outputs": [
+    {
+      "name": "invalid_stdout_accept",
+      "stream": "stdout",
+      "hex_bytes": "fffe6f6b0a",
+      "returncode": 0,
+      "expected_failure": null,
+      "expected_accepted": true
+    },
+    {
+      "name": "invalid_stderr_reject",
+      "stream": "stderr",
+      "hex_bytes": "8081feff6572726f720a",
+      "returncode": 1,
+      "expected_failure": null,
+      "expected_accepted": false
+    },
+    {
+      "name": "invalid_stderr_ice",
+      "stream": "stderr",
+      "hex_bytes": "fffe70616e69636b6564206174206c65786572",
+      "returncode": 1,
+      "expected_failure_prefix": "ICE:",
+      "expected_accepted": false
+    }
+  ],
+  "early_stop": {
+    "requested_cases": 25,
+    "expected_executed": 10,
+    "seed": 20261014
+  }
+}

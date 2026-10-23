@@ -1,0 +1,20 @@
+{
+  "corpus_entries": [
+    {
+      "name": "valid.hy",
+      "type": "file",
+      "hex_bytes": "666e206d61696e2829207b7d0a"
+    },
+    {
+      "name": "invalid_utf8.hy",
+      "type": "file",
+      "hex_bytes": "2f2f20fffe0a666e206d61696e2829207b7d0a"
+    },
+    {
+      "name": "subdir.hy",
+      "type": "dir"
+    }
+  ],
+  "expected_loaded_count": 2,
+  "config_error_exit_code": 2
+}
