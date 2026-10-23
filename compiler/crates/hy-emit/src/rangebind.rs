@@ -203,7 +203,8 @@ fn stmt_reads(s: &Stmt, target: &str) -> bool {
                         return true;
                     }
                     if var == target {
-                        return *inclusive && expr_reads(hi, target);
+                        return (*inclusive && expr_reads(hi, target))
+                            || expr_reads_before_range_bind(hi, target);
                     }
                     if expr_reads(hi, target) {
                         return true;
@@ -331,4 +332,93 @@ fn stmt_reads(s: &Stmt, target: &str) -> bool {
             false
         }
     }
+}
+
+fn expr_ordered_children(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Binary { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs, .. } => vec![lhs, rhs],
+        Expr::Unary { operand, .. } | Expr::AddrOf { operand, .. } | Expr::Move { operand, .. }
+        | Expr::Paren { inner: operand, .. } | Expr::Field { base: operand, .. }
+        | Expr::Receive { chan: operand, .. } | Expr::Try { operand, .. } => vec![operand],
+        Expr::Interp { parts, .. } => parts.iter().filter_map(|p| match p {
+            InterpPart::Expr(x) => Some(x),
+            InterpPart::Lit(_) => None,
+        }).collect(),
+        Expr::Call { callee, args, .. } => {
+            let c = if let Expr::Field { base, .. } = callee.as_ref() { base.as_ref() } else { callee };
+            std::iter::once(c).chain(args.iter().map(|a| &a.value)).collect()
+        }
+        Expr::Slice { base, lo, hi, .. } => std::iter::once(base.as_ref()).chain(lo.as_deref()).chain(hi.as_deref()).collect(),
+        Expr::StructLit { fields, .. } => fields.iter().map(|f| &f.value).collect(),
+        Expr::SliceLit { items, .. } => items.iter().collect(),
+        Expr::MapLit { entries, .. } => entries.iter().flat_map(|(k, v)| [k, v]).collect(),
+        Expr::FnLit { .. } | Expr::Lit { .. } | Expr::Ident { .. } => Vec::new(),
+    }
+}
+
+fn expr_any(e: &Expr, pred: fn(&Expr) -> bool) -> bool {
+    pred(e) || expr_ordered_children(e).into_iter().any(|c| expr_any(c, pred))
+}
+
+fn expr_has_hoistable_try(e: &Expr) -> bool {
+    expr_any(e, |x| matches!(x, Expr::Try { .. }))
+}
+
+fn expr_has_call_or_recv(e: &Expr) -> bool {
+    expr_any(e, |x| matches!(x, Expr::Call { .. } | Expr::Receive { .. } | Expr::Try { .. }))
+}
+
+fn expr_reads_before_range_bind(e: &Expr, target: &str) -> bool {
+    match e {
+        Expr::Try { operand, .. } => expr_reads(operand, target),
+        Expr::Binary { op, lhs, rhs, .. }
+            if matches!(op, hy_syntax::BinOp::And | hy_syntax::BinOp::Or) && expr_has_hoistable_try(rhs) =>
+        {
+            expr_reads(lhs, target) || expr_reads(rhs, target)
+        }
+        _ => {
+            let xs = expr_ordered_children(e);
+            xs.iter().enumerate().any(|(i, x)| {
+                expr_reads_before_range_bind(x, target)
+                    || (xs[i + 1..].iter().any(|r| expr_has_hoistable_try(r))
+                        && expr_has_call_or_recv(x)
+                        && expr_reads(x, target))
+            })
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn range_hi_shadows_loop_var(var: &str, hi: &Expr) -> bool {
+    var != "_" && expr_reads(hi, var)
+}
+
+#[allow(dead_code)]
+pub fn range_hi_needs_hoist(var: &str, hi: &Expr, body: &[Stmt]) -> bool {
+    !matches!(hi, Expr::Lit { .. })
+        && (range_hi_shadows_loop_var(var, hi)
+            || expr_has_call_or_recv(hi)
+            || stmts_mutate_expr_reads(body, hi))
+}
+
+#[allow(dead_code)]
+pub fn range_bound_temp_name(var: &str, line: usize) -> String {
+    format!("__hyb_hi_{}_{}", if var == "_" { "idx" } else { var }, line)
+}
+
+fn stmts_mutate_expr_reads(stmts: &[Stmt], hi: &Expr) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Assign { targets, .. } => targets.iter().any(|t| expr_reads(hi, t.root())),
+        Stmt::If { init, then, otherwise, .. } => {
+            init.as_deref().is_some_and(|i| stmts_mutate_expr_reads(std::slice::from_ref(i), hi))
+                || stmts_mutate_expr_reads(&then.stmts, hi)
+                || otherwise.as_deref().is_some_and(|o| stmts_mutate_expr_reads(std::slice::from_ref(o), hi))
+        }
+        Stmt::For { body, .. } | Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
+            stmts_mutate_expr_reads(&body.stmts, hi)
+        }
+        Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_mutate_expr_reads(&a.body.stmts, hi)),
+        Stmt::Select { arms, .. } => arms.iter().any(|a| stmts_mutate_expr_reads(&a.body.stmts, hi)),
+        _ => false,
+    })
 }
