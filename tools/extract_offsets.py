@@ -18,13 +18,9 @@ import subprocess
 import sys
 
 
-def run_readelf(binpath):
-    try:
-        proc = subprocess.run(["readelf", "--debug-dump=info", binpath],
-                              capture_output=True, text=True, timeout=600)
-    except OSError as exc:
-        print(f"FAILED: readelf execution error: {exc}", file=sys.stderr)
-        sys.exit(1)
+def main(binpath):
+    proc = subprocess.run(["readelf", "--debug-dump=info", binpath],
+                          capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
         err = proc.stderr.strip()
         msg = f"readelf failed with exit code {proc.returncode}"
@@ -32,11 +28,8 @@ def run_readelf(binpath):
             msg += f": {err}"
         print(f"FAILED: {msg}", file=sys.stderr)
         sys.exit(proc.returncode or 1)
-    return proc.stdout
 
-
-def main(binpath):
-    out = run_readelf(binpath)
+    out = proc.stdout
 
     dies = []
     cur = None
@@ -51,7 +44,7 @@ def main(binpath):
             continue
         if cur is None:
             continue
-        nm = re.search(r"DW_AT_name\s*:\s*(?:\([^)]*\)\s*:\s*)*(.+?)\s*$", line)
+        nm = re.search(r"DW_AT_name\s*:\s*(.+?)\s*$", line)
         off = re.search(
             r"DW_AT_data_member_location\s*:.*?\bDW_OP_plus_uconst:\s*(0x[0-9a-fA-F]+|\d+)"
             r"|DW_AT_data_member_location\s*:\s*(0x[0-9a-fA-F]+|\d+)\s*$",

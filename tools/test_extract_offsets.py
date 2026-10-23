@@ -189,20 +189,6 @@ class ExtractOffsetsTests(unittest.TestCase):
         self.assertIn("g_m              = 48", output)
         self.assertIn("g_stackguard0    = 16", output)
 
-    def test_readelf_oserror_exits_cleanly(self):
-        stderr_buf = io.StringIO()
-        with patch.object(
-            extractor.subprocess,
-            "run",
-            side_effect=FileNotFoundError("No such file or directory: 'readelf'"),
-        ):
-            with contextlib.redirect_stderr(stderr_buf):
-                with self.assertRaises(SystemExit) as cm:
-                    extractor.main("any_binary")
-        self.assertEqual(cm.exception.code, 1)
-        self.assertIn("FAILED:", stderr_buf.getvalue())
-        self.assertIn("readelf", stderr_buf.getvalue())
-
 
 if __name__ == "__main__":
     unittest.main()
