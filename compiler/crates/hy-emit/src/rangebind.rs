@@ -67,9 +67,46 @@ fn ty_reads(t: &TypeExpr, target: &str) -> bool {
     }
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Checks whether `s` reads `target`, accounting for parser-folded bracket
+/// arguments (`fns[i]`, `fns[grid[i]]`, `fns[cfg.slots[i]]`) produced when
+/// a bracketed expression is followed by `(` or `{`. Field/method segments
+/// immediately preceded by `.` are excluded because they name members rather
+/// than variable bindings.
+fn ident_reads_target(s: &str, target: &str) -> bool {
+    if s == target {
+        return true;
+    }
+    if !s.contains('[') || target.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let tbytes = target.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_byte(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
+            if !preceded_by_dot && &bytes[start..i] == tbytes {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 pub(crate) fn expr_reads(e: &Expr, target: &str) -> bool {
     match e {
-        Expr::Ident { name, .. } => name == target,
+        Expr::Ident { name, .. } => ident_reads_target(name, target),
         Expr::Lit { .. } => false,
         Expr::Interp { parts, .. } => parts.iter().any(|p| match p {
             InterpPart::Expr(x) => expr_reads(x, target),
@@ -87,7 +124,12 @@ pub(crate) fn expr_reads(e: &Expr, target: &str) -> bool {
                 || lo.as_ref().is_some_and(|x| expr_reads(x, target))
                 || hi.as_ref().is_some_and(|x| expr_reads(x, target))
         }
-        Expr::Field { base, .. } => expr_reads(base, target),
+        Expr::Field { base, name, .. } => {
+            expr_reads(base, target)
+                || name
+                    .find('[')
+                    .is_some_and(|idx| ident_reads_target(&name[idx..], target))
+        }
         Expr::Call { callee, args, .. } => {
             expr_reads(callee, target) || args.iter().any(|a| expr_reads(&a.value, target))
         }
@@ -292,7 +334,7 @@ fn stmt_reads(s: &Stmt, target: &str) -> bool {
                     MatchPattern::Path {
                         segments,
                         binding: Some(b),
-                    } if segments == &["some"] && b == target
+                    } if segments != &["none"] && b == target
                 ) {
                     continue;
                 }
