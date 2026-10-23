@@ -2240,7 +2240,9 @@ impl Emitter {
             match else_arm {
                 Some(arm) => {
                     self.push("} else {");
-                    self.emit_block_body(&arm.body.stmts)?;
+                    self.indent += 1;
+                    self.emit_arm_stmts_with_loans(&arm.body.stmts)?;
+                    self.indent -= 1;
                     self.push("}");
                 }
                 None => {
@@ -2311,7 +2313,9 @@ impl Emitter {
             match else_arm {
                 Some(arm) => {
                     self.push("} else {");
-                    self.emit_block_body(&arm.body.stmts)?;
+                    self.indent += 1;
+                    self.emit_arm_stmts_with_loans(&arm.body.stmts)?;
+                    self.indent -= 1;
                     self.push("}");
                 }
                 None => {
