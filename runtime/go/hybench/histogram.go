@@ -18,7 +18,10 @@
 //   - slow ops (µs and up): record every call directly.
 package hybench
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // SubHalf is the sub-bucket half-count: 2^10 linear sub-buckets per
 // exponent bucket ⇒ ~0.1% resolution (HDR's default).
@@ -38,7 +41,7 @@ type Histogram struct {
 
 // New allocates a histogram. The zero value is NOT usable; always New.
 func New() *Histogram {
-	h := &Histogram{subMask: SubHalf - 1, minVal: 1<<62 - 1}
+	h := &Histogram{subMask: SubHalf - 1, minVal: math.MaxInt64}
 	for e := 0; e < 64; e++ {
 		// exponent e covers magnitudes [2^e, 2^(e+1)); the sub-bucket
 		// index keeps the leading 1 implicit: shift so it drops off
@@ -64,14 +67,20 @@ func (h *Histogram) Record(ns int64) {
 	if ns < 0 {
 		return
 	}
-	h.count++
-	h.total += ns
-	if ns > h.maxVal {
+	if h.subMask == 0 {
+		h.subMask = SubHalf - 1
+		for e := 10; e < 64; e++ {
+			h.loShift[e] = e - 10
+		}
+	}
+	if h.count == 0 || ns > h.maxVal {
 		h.maxVal = ns
 	}
-	if ns < h.minVal {
+	if h.count == 0 || ns < h.minVal {
 		h.minVal = ns
 	}
+	h.count++
+	h.total += ns
 	if ns == 0 {
 		h.counts[0]++ // the dedicated zero bucket (e=0, sub=0)
 		return
@@ -99,7 +108,7 @@ func (h *Histogram) Mean() float64 {
 // ValueAt returns the ns value the given fraction (0..1) of samples fall
 // at or below (the upper bound of the bucket that crosses the rank).
 func (h *Histogram) ValueAt(fraction float64) int64 {
-	if h.count == 0 {
+	if h.count == 0 || math.IsNaN(fraction) {
 		return 0
 	}
 	if fraction <= 0 {
@@ -124,7 +133,18 @@ func (h *Histogram) ValueAt(fraction float64) int64 {
 				}
 				// implicit-leading-bit regime: re-add SubHalf
 				shift := uint(h.loShift[e])
-				return (SubHalf+int64(sub)+1)<<shift - 1
+				upperU := (uint64(SubHalf)+uint64(sub)+1)<<shift - 1
+				if upperU > uint64(math.MaxInt64) {
+					upperU = uint64(math.MaxInt64)
+				}
+				val := int64(upperU)
+				if val > h.maxVal {
+					val = h.maxVal
+				}
+				if val < h.minVal {
+					val = h.minVal
+				}
+				return val
 			}
 		}
 	}
