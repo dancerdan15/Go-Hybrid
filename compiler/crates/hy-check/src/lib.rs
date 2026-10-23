@@ -394,6 +394,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     // N1: the declared result shapes (return-site nil checks, HYB-E4001),
     // plus named result bindings (`fn f() (out map[string]int)`), which are
     // function-scoped mutable local variables in Go and returned by bare `return`.
+    ck.check_named_results(&f.results);
     for r in &f.results {
         let shape = ck.shape_of_type(&r.ty);
         if let Some(name) = &r.name {
@@ -446,7 +447,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             for ev in evs {
                 match ev {
                     walk::ScopeEvent::Push => st.scope_push(),
-                    walk::ScopeEvent::Pop => st.scope_pop(),
+                    walk::ScopeEvent::Pop => pop_scope(&mut st),
                     walk::ScopeEvent::SelectRecv { names, chan } => {
                         let elem = match ck.shape_of_expr(&st, chan) {
                             TypeShape::Chan(e) => *e,
@@ -528,6 +529,11 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         let mut fnlits = Vec::new();
         walk::own_fnlits(stmt, &mut fnlits);
         if !fnlits.is_empty() {
+            for fl in &fnlits {
+                if let Expr::FnLit { results, .. } = crate::model::unwrap_parens(fl) {
+                    ck.check_named_results(results);
+                }
+            }
             if let Some(top) = st.fnlit_scopes.last_mut() {
                 for fl in fnlits {
                     let sp = fl.span();
@@ -699,27 +705,42 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     );
                     let is_chan = matches!(ck.shape_of_expr(&st, expr), TypeShape::Chan(_));
                     let shapes = ck.iterate_var_shapes(&st, expr, vars.len());
-                    for (name, shape) in vars.iter().zip(shapes) {
-                        let is_ref = shape.is_reference_alias();
-                        let may_share = ck.shape_may_share(&shape);
-                        ck.define_binding(&mut st, name, shape, None, false, managed, false);
-                        if !is_chan {
-                            if may_share {
-                                ck.record_may_share(&mut st, name, expr);
-                            }
-                            if is_ref {
-                                if let Some(root) = expr.root_ident() {
-                                    if ck.lookup_binding(&st, root).is_some() {
-                                        st.aliases.insert(name.clone(), root.to_string());
-                                    }
-                                }
-                            }
+                    let mut order: Vec<(usize, &String, TypeShape)> = vars
+                        .iter()
+                        .zip(shapes)
+                        .map(|(n, s)| {
+                            let rank = if is_chan || !ck.shape_may_share(&s) {
+                                2
+                            } else if ck.lookup_binding(&st, n).is_some() {
+                                1
+                            } else {
+                                0
+                            };
+                            (rank, n, s)
+                        })
+                        .collect();
+                    order.sort_by_key(|(r, _, _)| *r);
+                    for (rank, name, shape) in order {
+                        if rank < 2 {
+                            ck.bind_match_arm(&mut st, name, expr, managed);
                             if let Some(b) = st.env_lookup_mut(name) {
-                                b.non_owned_origin = Some(format!(
-                                    "range variable `{}` iterating `{}` (the collection still holds the element)",
-                                    name,
-                                    expr.render()
-                                ));
+                                b.shape = shape;
+                                b.ty = None;
+                            }
+                        } else {
+                            ck.define_binding(&mut st, name, shape, None, false, managed, false);
+                        }
+                    }
+                    if !is_chan {
+                        for name in vars {
+                            if let Some(b) = st.env_lookup_mut(name) {
+                                if !b.non_owned_origin.as_deref().is_some_and(|o| o.contains("`const ")) {
+                                    b.non_owned_origin = Some(format!(
+                                        "range variable `{}` iterating `{}` (the collection still holds the element)",
+                                        name,
+                                        expr.render()
+                                    ));
+                                }
                             }
                         }
                     }
@@ -890,7 +911,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     // capture of a block-local now resolves to nothing and fails closed
     // (HYB-E3005) at the boundary, exactly like any unresolvable name.
     while !st.scopes.is_empty() {
-        st.scope_pop();
+        pop_scope(&mut st);
     }
 
     // #123: closure bodies sit outside Pass B (A5), so process_assign and
@@ -906,7 +927,47 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     closures::check_closure_boundaries(ck, &st, body);
 }
 
+fn pop_scope(st: &mut FnState) {
+    if let Some(top) = st.scopes.last() {
+        let len = st.scopes.len();
+        for (k, links) in &st.shadow_links {
+            if top.contains_key(k) {
+                if let Some((sname, _)) = links.iter().find(|(s, d)| {
+                    *d < len && !st.scopes[*d..len - 1].iter().any(|l| l.contains_key(s))
+                }) {
+                    st.aliases.entry(k.clone()).or_insert_with(|| sname.clone());
+                    st.aliases.entry(sname.clone()).or_insert_with(|| sname.clone());
+                }
+            }
+        }
+    }
+    st.scope_pop();
+}
+
 impl<'a> Checker<'a> {
+    fn check_named_results(&mut self, results: &[hy_syntax::ResultParam]) {
+        for r in results {
+            if let Some(name) = r.name.as_deref().filter(|&n| n != "_") {
+                if let Some(reason) = self.no_zero_value_reason(&r.ty, 0) {
+                    let msg = format!(
+                        "`{}` has no zero value — named return parameter `{}` cannot be zero-initialized (HYB-E4002)",
+                        r.ty.render(),
+                        name
+                    );
+                    self.diags.push(
+                        Diagnostic::error("HYB-E4002", self.path.clone(), r.ty.span(), msg)
+                            .with_notes(vec![
+                                format!("why: {}", reason),
+                                format!(
+                                    "fix: use an unnamed return type `{}` and return an explicit value, or reorder the enum variants so the first variant is payload-free",
+                                    r.ty.render()
+                                ),
+                            ]),
+                    );
+                }
+            }
+        }
+    }
     /// Row 14 (discussion #4): audit a `managed` block's reason/category/tickets
     /// and record it in `managed_audit` (shared between Pass B and closures.rs).
     pub(crate) fn audit_managed_block(
