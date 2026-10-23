@@ -485,12 +485,48 @@ impl<'a> Lexer<'a> {
                         s.push(c);
                     }
                     self.bump();
+                } else if matches!(c, '+' | '-')
+                    && (s.ends_with(['p', 'P']) || (base != 'x' && s.ends_with(['e', 'E'])))
+                    && self.at(1).is_some_and(|n| n.is_ascii_alphanumeric())
+                {
+                    s.push(c);
+                    self.bump();
                 } else {
                     break;
                 }
             }
+            let mut has_frac = false;
+            if self.at(0) == Some('.') && self.at(1) != Some('.') {
+                has_frac = true;
+                s.push('.');
+                self.bump();
+                while let Some(c) = self.at(0) {
+                    if c == '_' || c.is_ascii_alphanumeric() {
+                        if c != '_' {
+                            s.push(c);
+                        }
+                        self.bump();
+                    } else if matches!(c, '+' | '-')
+                        && s.ends_with(['p', 'P', 'e', 'E'])
+                        && self.at(1).is_some_and(|n| n.is_ascii_alphanumeric())
+                    {
+                        s.push(c);
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+            }
             let digits = &s[2..];
-            if digits.is_empty() {
+            if has_frac {
+                self.escape_diag(
+                    start,
+                    false,
+                    format!(
+                        "malformed 0{base} integer literal `{s}`: prefixed base literals cannot have a fractional part"
+                    ),
+                );
+            } else if digits.is_empty() {
                 self.escape_diag(
                     start,
                     false,
