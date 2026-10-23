@@ -641,13 +641,39 @@ fn generate_one(
 ///   replace hybrid.program => ./hybridrt
 /// and emitted imports resolve as ordinary local packages. Idempotent.
 fn cmd_vendor_runtime(args: &[String]) -> ExitCode {
-    let dir = match args.iter().find(|a| !a.starts_with("--")) {
-        Some(d) => std::path::PathBuf::from(d),
-        None => {
-            eprintln!("usage: hyb vendor-runtime <dir>  (creates <dir>/hybridrt)");
+    const USAGE: &str = "usage: hyb vendor-runtime <dir>  (creates <dir>/hybridrt)";
+    let (mut dir, mut end_of_options, mut i) = (None, false, 0);
+    while i < args.len() {
+        let arg = &args[i];
+        if !end_of_options {
+            match arg.as_str() {
+                "--" => { end_of_options = true; i += 1; continue; }
+                "--target-dir" => {
+                    let Some(val) = args.get(i + 1).filter(|v| !v.is_empty() && !v.starts_with('-')) else {
+                        eprintln!("hyb vendor-runtime: --target-dir requires a value\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    if dir.replace(std::path::PathBuf::from(val)).is_some() {
+                        eprintln!("hyb vendor-runtime: expected a single target directory\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                    i += 2;
+                    continue;
+                }
+                v if v.starts_with('-') => {
+                    eprintln!("hyb vendor-runtime: unknown option: {v}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if dir.replace(std::path::PathBuf::from(arg)).is_some() {
+            eprintln!("hyb vendor-runtime: expected a single target directory; unexpected argument: {arg}\n{USAGE}");
             return ExitCode::from(2);
         }
-    };
+        i += 1;
+    }
+    let Some(dir) = dir else { eprintln!("{USAGE}"); return ExitCode::from(2); };
     let rt = match runtime_dir() {
         Ok(r) => r,
         Err(e) => {
@@ -680,7 +706,11 @@ fn cmd_vendor_runtime(args: &[String]) -> ExitCode {
         let name = e.file_name();
         let out_pkg = dst.join(&name);
         std::fs::create_dir_all(&out_pkg).ok();
-        for f in std::fs::read_dir(&p).unwrap_or_else(|_| unreachable!()).flatten() {
+        let Ok(pkg_entries) = std::fs::read_dir(&p) else {
+            eprintln!("error reading {}", p.display());
+            return ExitCode::FAILURE;
+        };
+        for f in pkg_entries.flatten() {
             let fp = f.path();
             if fp.is_file() {
                 let dstf = out_pkg.join(f.file_name());
@@ -722,29 +752,57 @@ fn render_build_error(e: &BuildError) -> String {
 }
 
 fn cmd_build(args: &[String]) -> ExitCode {
-    // The .hy file: the first arg ending in .hy (flag values never do).
-    let file = args.iter().find(|a| a.ends_with(".hy")).cloned();
+    const USAGE: &str = "usage: hyb build <file.hy> -o <bin-path> [--emit-go] [--deny-managed] | --package <name> --out-dir <dir> [--binding-prefix <path>]";
+    let (mut file, mut out_path, mut pkg_name, mut out_dir, mut binding_prefix) = (None, None, None, None, None);
+    let (mut emit_go_only, mut deny_managed, mut end_of_options, mut i) = (false, false, false, 0);
+    while i < args.len() {
+        let arg = &args[i];
+        if !end_of_options {
+            match arg.as_str() {
+                "--" => { end_of_options = true; i += 1; continue; }
+                "--emit-go" => { emit_go_only = true; i += 1; continue; }
+                "--deny-managed" => { deny_managed = true; i += 1; continue; }
+                flag @ ("-o" | "--package" | "--out-dir" | "--binding-prefix") => {
+                    let Some(val) = args.get(i + 1).filter(|v| !v.is_empty() && !v.starts_with('-')) else {
+                        eprintln!("hyb build: {flag} requires a value\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    let slot = match flag {
+                        "-o" => &mut out_path,
+                        "--package" => &mut pkg_name,
+                        "--out-dir" => &mut out_dir,
+                        _ => &mut binding_prefix,
+                    };
+                    if slot.replace(val.clone()).is_some() {
+                        eprintln!("hyb build: {flag} may only be supplied once\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                    i += 2;
+                    continue;
+                }
+                v if v.starts_with('-') => {
+                    eprintln!("hyb build: unknown option: {v}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if file.replace(arg.clone()).is_some() {
+            eprintln!("hyb build: expected exactly one input file; unexpected argument: {arg}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+        i += 1;
+    }
     let Some(file) = file else {
-        eprintln!("usage: hyb build <file.hy> -o <bin-path> [--emit-go] | --package <name> --out-dir <dir> [--binding-prefix <path>]");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let out_idx = args.iter().position(|a| a == "-o");
-    let out_path = out_idx
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "a.out".to_string());
-    let emit_go_only = args.iter().any(|a| a == "--emit-go");
-    // Package mode (example 09): emit an importable Go package + the
-    // runtime pieces, instead of building a binary.
-    let pkg_idx = args.iter().position(|a| a == "--package");
-    let pkg_name = pkg_idx.and_then(|i| args.get(i + 1)).cloned();
-    let outdir_idx = args.iter().position(|a| a == "--out-dir");
-    let out_dir = outdir_idx.and_then(|i| args.get(i + 1)).cloned();
-    let bprefix_idx = args.iter().position(|a| a == "--binding-prefix");
-    let binding_prefix = bprefix_idx
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "hybrid.program".to_string());
+    if pkg_name.is_some() != out_dir.is_some() {
+        eprintln!("hyb build: --package and --out-dir must be used together\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let out_path = out_path.unwrap_or_else(|| "a.out".to_string());
+    let binding_prefix = binding_prefix.unwrap_or_else(|| "hybrid.program".to_string());
 
     // --- 1. Toolchain pin enforcement (HYB-E9001) ---
     // The walking skeleton's reproducibility guard (DX study: ~30 lines).
@@ -812,6 +870,13 @@ fn cmd_build(args: &[String]) -> ExitCode {
         for d in &result.diagnostics {
             println!("{}", d.render_head());
         }
+        return ExitCode::FAILURE;
+    }
+    if deny_managed && result.managed.managed_blocks > 0 {
+        eprintln!(
+            "hyb build: deny-managed: {} managed block(s) present — build failed by policy (--deny-managed); audit the block(s) or remove them (HYB-E8001 counts them under --report-managed)",
+            result.managed.managed_blocks
+        );
         return ExitCode::FAILURE;
     }
 
