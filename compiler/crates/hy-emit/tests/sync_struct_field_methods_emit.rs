@@ -22,10 +22,14 @@ fn main() {
     p := pool_guard{}
     p.mu.lock()
     p.mu.unlock()
-    _ = p.mu.try_lock()
+    if p.mu.try_lock() {
+        p.mu.unlock()
+    }
     p.mu.rlock()
     p.mu.runlock()
-    _ = p.mu.try_rlock()
+    if p.mu.try_rlock() {
+        p.mu.runlock()
+    }
     p.alt.rlock()
     p.alt.runlock()
     p.wg.add(1)

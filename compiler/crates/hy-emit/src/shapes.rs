@@ -64,17 +64,11 @@ const fn method(go: &'static str, result: Option<&'static str>) -> Member {
 }
 
 const SERDE_JSON_MEMBERS: &[(&str, Member)] = &[
-    ("array", method("Array", Some("serde_json.value"))),
+    ("array", method("Array", None)),
     ("int", method("Int", None)),
     ("string", method("String", None)),
-    ("get", method("Get", Some("serde_json.value"))),
     ("set", method("Set", None)),
-    ("set_int", method("SetInt", None)),
-    ("set_bool", method("SetBool", None)),
     ("push_string", method("PushString", None)),
-    ("remove", method("Remove", None)),
-    ("to_string_pretty", method("ToStringPretty", None)),
-    ("release", method("Release", None)),
 ];
 
 const SYNC_RWMUTEX_MEMBERS: &[(&str, Member)] = &[
@@ -332,25 +326,13 @@ pub static METHOD_RESULTS: &[(&str, &str, (u8, bool))] = &[
     ("serde_json.value", "array", (1, true)),
     ("serde_json.value", "int", (1, true)),
     ("serde_json.value", "string", (1, true)),
-    ("serde_json.value", "get", (1, true)),
-    ("serde_json.value", "to_string_pretty", (1, true)),
     ("serde_json.value", "set", (0, true)),
-    ("serde_json.value", "set_int", (0, true)),
-    ("serde_json.value", "set_bool", (0, true)),
-    ("serde_json.value", "remove", (0, true)),
     ("serde_json.value", "push_string", (0, true)),
-    ("serde_json.value", "release", (0, false)),
     ("serde_json.view", "array", (1, true)),
     ("serde_json.view", "int", (1, true)),
     ("serde_json.view", "string", (1, true)),
-    ("serde_json.view", "get", (1, true)),
-    ("serde_json.view", "to_string_pretty", (1, true)),
     ("serde_json.view", "set", (0, true)),
-    ("serde_json.view", "set_int", (0, true)),
-    ("serde_json.view", "set_bool", (0, true)),
-    ("serde_json.view", "remove", (0, true)),
     ("serde_json.view", "push_string", (0, true)),
-    ("serde_json.view", "release", (0, false)),
 ];
 
 pub fn lookup_method_results(ty: &str, name: &str) -> Option<(u8, bool)> {
@@ -548,6 +530,7 @@ pub static RUST_TYPES: &[(&str, &str, &str)] = &[
     // (hy type, binding root, Go type)
     ("serde_json.value", "jsonbinding", "Value"),
     ("serde_json.view", "jsonbinding", "Value"),
+    // Not Rust-owned: Go stdlib types whose initialism `go_type_name` cannot spell.
     ("sync.rw_mutex", "sync", "RWMutex"),
     ("sync.rwmutex", "sync", "RWMutex"),
 ];
