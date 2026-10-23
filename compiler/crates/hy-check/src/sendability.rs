@@ -21,7 +21,7 @@
 
 use crate::model::{as_addr_of, unwrap_parens, Binding, Checker, FnState, MoveKind, TypeShape};
 use hy_diag::{Diagnostic, Span};
-use hy_syntax::{Expr, LitKind, TypeExpr};
+use hy_syntax::{BinOp, Expr, LitKind, TypeExpr, UnOp};
 
 /// The spawn-callee proof (O4.0): what the checker concluded about the
 /// expression a `task` statement spawns.
@@ -688,12 +688,8 @@ impl<'a> Checker<'a> {
             (ForeignOpaque(_), _) | (_, ForeignOpaque(_)) => true,
             (Primitive, Primitive) | (Str, Str) | (Atomic, Atomic) => true,
             (Struct(Some(a)), Struct(Some(b))) => a == b,
-            (Map(_, _), Map(_, _)) => true,
-            (Slice(_), Slice(_)) | (Array(_), Array(_)) => true,
-            // Go converts between slice and array of the same element class
-            // only in limited cases; keep coarse-class permissive here.
-            (Slice(_), Array(_)) | (Array(_), Slice(_)) => true,
-            (Pointer(_), Pointer(_)) => true,
+            (Map(gk, gv), Map(wk, wv)) => Self::shape_may_be_elem(gk, wk) && Self::shape_may_be_elem(gv, wv),
+            (Slice(a), Slice(b)) | (Array(a), Array(b)) | (Pointer(a), Pointer(b)) => Self::shape_may_be_elem(a, b),
             (Chan(a), Chan(b)) => Self::shape_may_be_elem(a, b),
             (Closure, Closure) => true,
             (OwnHandle(a), OwnHandle(b)) | (BorrowHandle(a), BorrowHandle(b)) => a == b,
@@ -749,6 +745,13 @@ impl<'a> Checker<'a> {
     }
 
     fn push_chan_elem_mismatch(&mut self, span: Span, msg: String) {
+        if self.diags.iter().any(|d| {
+            d.severity == hy_diag::Severity::Error
+                && (d.span.start.line, d.span.start.col) <= (span.end.line, span.end.col)
+                && (span.start.line, span.start.col) <= (d.span.end.line, d.span.end.col)
+        }) {
+            return;
+        }
         let notes = vec![
             "why: the accepted subset only emits buildable Go; a mismatched channel element fails `go build` with `cannot use ... as ... value in send` / assignment (issue #146)".to_string(),
             "fix: send/receive a value of the declared element type, or change the channel's element type to match".to_string(),
@@ -816,6 +819,99 @@ impl<'a> Checker<'a> {
         if let Some(elem_ty) = self.chan_elem_ty(st, chan) {
             let desc = format!("channel `{}`", chan.render());
             self.check_const_overflow_init(&desc, &elem_ty, value, Some(st));
+            let inner = match unwrap_parens(value) {
+                Expr::Move { operand, .. } => unwrap_parens(operand),
+                other => other,
+            };
+            if let Some(got_ty) = self.infer_send_expr_ty(st, inner, 0) {
+                let untyped_int = matches!(inner, Expr::Lit { kind: LitKind::Int(_) | LitKind::Char(_), .. });
+                if !self.type_expr_may_be_elem(&got_ty, &elem_ty, untyped_int, 0) {
+                    let (g, w) = (self.resolve_type_alias(&got_ty).render(), self.resolve_type_alias(&elem_ty).render());
+                    let msg = format!("`{}` has type `{g}` but the channel element type is `{w}` (HYB-E3011)", value.render());
+                    self.push_chan_elem_mismatch(value.span(), msg);
+                }
+            }
+        }
+    }
+
+    fn infer_send_expr_ty(&self, st: &FnState, expr: &Expr, depth: usize) -> Option<TypeExpr> {
+        if depth > 8 { return None; }
+        let e = match unwrap_parens(expr) {
+            Expr::Move { operand, .. } => unwrap_parens(operand),
+            other => other,
+        };
+        if let Expr::Call { callee, args, span } = e {
+            if matches!(unwrap_parens(callee), Expr::Ident { name, .. } if name == "some" && self.lookup_binding(st, name).is_none()) {
+                let elem = args.first().and_then(|a| self.infer_send_expr_ty(st, &a.value, depth + 1))?;
+                return Some(TypeExpr::Option { elem: Box::new(elem), span: *span });
+            }
+        }
+        if let Some(ty) = self.ty_of_expr(st, e) {
+            return Some(ty);
+        }
+        let mk = |n: &str| Some(TypeExpr::Named { name: n.to_string(), span: e.span() });
+        match e {
+            Expr::Ident { name, span } => self.const_values.get(name.as_str()).and_then(|cv| self.infer_send_expr_ty(st, cv, depth + 1)).or_else(|| {
+                self.file.fns().flat_map(|f| f.body.iter().flat_map(|b| &b.stmts)).find_map(|s| match s {
+                    hy_syntax::Stmt::Local(l) if l.names.len() == 1 && l.names[0] == *name && l.span.start.line < span.start.line => l.values.first().and_then(|v| self.infer_send_expr_ty(st, v, depth + 1)),
+                    _ => None,
+                })
+            }),
+            Expr::Lit { kind: LitKind::Bool(_), .. } | Expr::Unary { op: UnOp::Not, .. }
+            | Expr::Binary { op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or, .. } => mk("bool"),
+            Expr::Lit { kind: LitKind::Int(_), .. } => mk("int"),
+            Expr::Lit { kind: LitKind::Char(_), .. } => mk("rune"),
+            Expr::Lit { kind: LitKind::Float(_), .. } => mk("float64"),
+            Expr::Lit { kind: LitKind::Str(_) | LitKind::RawStr(_), .. } | Expr::Interp { .. } => mk("string"),
+            Expr::Unary { op: UnOp::Neg | UnOp::BitNot, operand, .. } => self.infer_send_expr_ty(st, operand, depth + 1),
+            _ => None,
+        }
+    }
+
+    fn type_expr_may_be_elem(&self, got: &TypeExpr, want: &TypeExpr, untyped_int: bool, depth: usize) -> bool {
+        if depth > 8 { return true; }
+        let (g, w) = (self.resolve_type_alias(got), self.resolve_type_alias(want));
+        let is_known_named = |n: &str| {
+            let b = Self::base_named_type_str(n);
+            Self::prim_elem_kind(n).is_some() || self.structs.contains_key(b) || self.enums.contains_key(b) || b == "set"
+        };
+        match (&g, &w) {
+            (TypeExpr::Slice { elem: a, .. }, TypeExpr::Slice { elem: b, .. })
+            | (TypeExpr::Pointer { to: a, .. }, TypeExpr::Pointer { to: b, .. })
+            | (TypeExpr::Chan { elem: a, .. }, TypeExpr::Chan { elem: b, .. })
+            | (TypeExpr::Option { elem: a, .. }, TypeExpr::Option { elem: b, .. }) => self.type_expr_may_be_elem(a, b, false, depth + 1),
+            (TypeExpr::Array { len: la, elem: a, .. }, TypeExpr::Array { len: lb, elem: b, .. }) => {
+                let len_ok = match (la.as_deref(), lb.as_deref()) {
+                    (Some(Expr::Lit { kind: LitKind::Int(na), .. }), Some(Expr::Lit { kind: LitKind::Int(nb), .. })) => na == nb,
+                    _ => true,
+                };
+                len_ok && self.type_expr_may_be_elem(a, b, false, depth + 1)
+            }
+            (TypeExpr::Map { key: ka, value: va, .. }, TypeExpr::Map { key: kb, value: vb, .. }) => {
+                self.type_expr_may_be_elem(ka, kb, false, depth + 1) && self.type_expr_may_be_elem(va, vb, false, depth + 1)
+            }
+            (TypeExpr::Named { name: na, .. }, TypeExpr::Named { name: nb, .. }) => {
+                if na == nb || !is_known_named(na) || !is_known_named(nb) { return true; }
+                if let (Some((ba, args_a)), Some((bb, args_b))) = (Self::parse_generic_type_args(na), Self::parse_generic_type_args(nb)) {
+                    return ba == bb && args_a.len() == args_b.len() && args_a.iter().zip(args_b.iter()).all(|(a, b)| self.type_expr_may_be_elem(a, b, false, depth + 1));
+                }
+                matches!((Self::prim_elem_kind(na), Self::prim_elem_kind(nb)), (Some(ka), Some(kb)) if ka == kb || (untyped_int && ka == "int" && kb == "float"))
+            }
+            (TypeExpr::Named { name, .. }, _) | (_, TypeExpr::Named { name, .. }) => !is_known_named(name),
+            (TypeExpr::Fn { .. }, TypeExpr::Fn { .. }) => true,
+            _ => false,
+        }
+    }
+
+    fn prim_elem_kind(name: &str) -> Option<&'static str> {
+        match name {
+            "bool" => Some("bool"),
+            "string" => Some("string"),
+            "float32" | "float64" | "f32" | "f64" => Some("float"),
+            "int" | "int8" | "int16" | "int32" | "int64" | "i8" | "i16" | "i32" | "i64" | "isize"
+            | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "u8" | "u16" | "u32" | "u64"
+            | "usize" | "uintptr" | "byte" | "rune" | "char" => Some("int"),
+            _ => None,
         }
     }
 
@@ -1208,7 +1304,16 @@ impl<'a> Checker<'a> {
                 }
                 if let Expr::Ident { name, .. } = op {
                     match self.classify_move_ident(st, name) {
-                        Outcome::Ok => {}
+                        Outcome::Ok => {
+                            if code == "HYB-E3002" {
+                                if let Some(want) = target_shapes.and_then(|ts| ts.get(vi)) {
+                                    let got = self.shape_of_expr(st, v);
+                                    if !matches!(got, TypeShape::Unknown) && !Self::shape_may_be_elem(&got, want) {
+                                        self.emit_chan_elem_mismatch_send(&got, want, v.span(), &format!("`{}`", v.render()));
+                                    }
+                                }
+                            }
+                        }
                         Outcome::Managed { desc, risky } => {
                             if risky {
                                 managed_descs.push(desc);
