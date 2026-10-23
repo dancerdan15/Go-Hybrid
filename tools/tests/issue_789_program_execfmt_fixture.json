@@ -1,0 +1,8 @@
+{
+  "stage": "run",
+  "first_case": "01-bad-binfmt.hy",
+  "second_case": "02-ok.hy",
+  "errno": 8,
+  "oserror_msg": "Exec format error",
+  "expected_prefix": "program could not be run:"
+}

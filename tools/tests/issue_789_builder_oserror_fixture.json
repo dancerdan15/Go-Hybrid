@@ -1,0 +1,8 @@
+{
+  "stage": "build",
+  "first_case": "01-bad-builder.hy",
+  "second_case": "02-ok.hy",
+  "errno": 13,
+  "oserror_msg": "Permission denied",
+  "expected_prefix": "builder could not be run:"
+}

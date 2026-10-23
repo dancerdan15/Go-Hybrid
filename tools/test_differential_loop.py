@@ -447,3 +447,96 @@ class TimeoutCorpusTests(unittest.TestCase):
         status, output = self.run_with_timeout(None)
         self.assertEqual(status, 0, output)
         self.assertIn("differential: FULL AGREEMENT", output)
+
+
+class ProcessLaunchTests(unittest.TestCase):
+    """issue-789: an unexecutable builder or built program (OSError on spawn)
+    must be reported as a per-case failure so the differential loop continues
+    through remaining corpus files and emits the aggregate summary."""
+
+    FIXTURE_DIR = pathlib.Path(__file__).with_name("tests")
+
+    def load_fixture(self, filename):
+        path = self.FIXTURE_DIR / filename
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def run_fixture_corpus(self, fixture_name):
+        cfg = self.load_fixture(fixture_name)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first_case = cfg["first_case"]
+            second_case = cfg["second_case"]
+            (root / first_case).write_text(
+                "// EXPECTED-VERDICT: ACCEPT\nfn main() {}\n", encoding="utf-8")
+            (root / second_case).write_text(
+                "// EXPECTED-VERDICT: ACCEPT\nfn main() {}\n", encoding="utf-8")
+            first_run_pending = False
+
+            def simulate_spawn(command, **kwargs):
+                nonlocal first_run_pending
+                if len(command) > 1 and command[1] == "build":
+                    is_first = pathlib.Path(command[2]).name == first_case
+                    if is_first and cfg["stage"] == "build":
+                        raise OSError(cfg["errno"], cfg["oserror_msg"])
+                    (pathlib.Path(kwargs["cwd"]) / "a.out").touch()
+                    first_run_pending = is_first
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if first_run_pending and cfg["stage"] == "run":
+                    first_run_pending = False
+                    raise OSError(cfg["errno"], cfg["oserror_msg"])
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            output = io.StringIO()
+            with patch.object(sys, "argv", [
+                    str(HARNESS), "--bin", sys.executable, "--corpus", str(root)]), \
+                 patch.object(HARNESS_MOD.subprocess, "run", side_effect=simulate_spawn), \
+                 contextlib.redirect_stdout(output):
+                status = HARNESS_MOD.main()
+            return cfg, status, output.getvalue()
+
+    def assert_fixture_reported_and_continued(self, fixture_name):
+        cfg, status, output = self.run_fixture_corpus(fixture_name)
+        self.assertEqual(status, 1, output)
+        self.assertIn(f"FAIL  {cfg['first_case']}", output)
+        self.assertIn(cfg["expected_prefix"], output)
+        self.assertIn(cfg["oserror_msg"], output)
+        self.assertIn(f"PASS  {cfg['second_case']} (ACCEPT: exit 0)", output)
+        self.assertIn("differential accept-side (build+run): 1/2", output)
+        self.assertIn("differential: 1 disagreement(s)", output)
+        self.assertNotIn("FULL AGREEMENT", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_builder_oserror_reports_failure_and_continues(self):
+        self.assert_fixture_reported_and_continued(
+            "issue_789_builder_oserror_fixture.json")
+
+    def test_program_permission_error_reports_failure_and_continues(self):
+        self.assert_fixture_reported_and_continued(
+            "issue_789_program_perm_fixture.json")
+
+    def test_program_exec_format_error_reports_failure_and_continues(self):
+        self.assert_fixture_reported_and_continued(
+            "issue_789_program_execfmt_fixture.json")
+
+    def test_real_oserror_on_missing_builder_is_caught(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            ok, detail = HARNESS_MOD.build_and_run(
+                str(root / "nonexistent-hyb"), "case.hy", str(root))
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("builder could not be run:"), detail)
+
+    def test_real_oserror_on_unexecutable_program_is_caught(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / "a.out").mkdir()
+
+            def fake_build_only(command, **kwargs):
+                if len(command) > 1 and command[1] == "build":
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return REAL_RUN(command, **kwargs)
+
+            with patch.object(HARNESS_MOD.subprocess, "run", side_effect=fake_build_only):
+                ok, detail = HARNESS_MOD.build_and_run("hyb", "case.hy", str(root))
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("program could not be run:"), detail)
