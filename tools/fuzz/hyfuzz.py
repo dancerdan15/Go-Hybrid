@@ -111,36 +111,25 @@ def gen_nest(rng):
     return body
 
 
-def _decode_output(data):
-    if data is None:
-        return ""
-    if isinstance(data, bytes):
-        return data.decode("utf-8", errors="replace")
-    return str(data)
-
-
 def check_one(hyb, src, workdir, timeout):
     """Return (failure, accepted) from one checker execution."""
     path = os.path.join(workdir, "case.hy")
-    with open(path, "w", encoding="utf-8", errors="replace") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(src)
     try:
         r = subprocess.run(
             [hyb, "check", path], cwd=workdir, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            text=True, timeout=timeout,
         )
-    except subprocess.TimeoutExpired as exc:
-        _decode_output(exc.stdout)
-        _decode_output(exc.stderr)
+    except subprocess.TimeoutExpired:
         return "HANG", False
     except OSError as err:
         return f"EXEC_ERROR: {err}", False
-    out = _decode_output(r.stdout) + _decode_output(r.stderr)
     if r.returncode not in (0, 1):
         return f"UNEXPECTED exit={r.returncode}", False
-    blob = out.lower()
+    blob = (r.stdout + r.stderr).lower()
     if any(b in blob for b in BAD_TEXT):
-        return f"ICE: {out[:120]}", False
+        return f"ICE: {(r.stdout + r.stderr)[:120]}", False
     return None, r.returncode == 0
 
 
@@ -148,7 +137,7 @@ def save_failure(run_dir, seed, index, kind, failure, src):
     """Write data-only reproductions using generated names and exclusive creates."""
     filename = f"case-{index:06d}.hy"
     source_path = os.path.join(run_dir, filename)
-    encoded = src.encode("utf-8", errors="replace")
+    encoded = src.encode("utf-8")
     with open(source_path, "xb") as f:
         f.write(encoded)
     metadata = {
@@ -185,28 +174,23 @@ def main():
     # failure of 2026-10-14 — FileNotFoundError, exit 1 before case 1)
     args.hyb = os.path.abspath(args.hyb)
     if not os.path.isfile(args.hyb):
-        print(f"hyfuzz: --hyb binary not found: {args.hyb}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(f"hyfuzz: --hyb binary not found: {args.hyb}")
     if not os.access(args.hyb, os.X_OK):
         print(f"hyfuzz: --hyb binary is not executable: {args.hyb}", file=sys.stderr)
         raise SystemExit(2)
     if not os.path.isdir(args.corpus):
-        print(f"hyfuzz: --corpus directory not found: {args.corpus}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(f"hyfuzz: --corpus directory not found: {args.corpus}")
     if args.cases <= 0:
-        print("hyfuzz: --cases must be positive", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit("hyfuzz: --cases must be positive")
     if not (math.isfinite(args.timeout) and args.timeout > 0):
-        print("hyfuzz: --timeout must be positive", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit("hyfuzz: --timeout must be positive")
     corpus = load_corpus(args.corpus)
     if not corpus:
-        print("fuzz: no corpus programs found", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit("fuzz: no corpus programs found")
 
     failures = []
     failure_run_dir = None
-    clean_rejects = ok_accepts = executed = 0
+    clean_rejects = ok_accepts = 0
     with tempfile.TemporaryDirectory(prefix="hyfuzz-") as workdir:
         for i in range(args.cases):
             kind = i % 3
@@ -217,7 +201,6 @@ def main():
             else:
                 src = gen_nest(rng)
             bad, accepted = check_one(args.hyb, src, workdir, args.timeout)
-            executed += 1
             if bad:
                 failures.append((i, kind, bad, src[:200]))
                 if args.failures_dir is not None:
@@ -239,7 +222,7 @@ def main():
             else:
                 clean_rejects += 1
 
-    print(f"hyfuzz: {executed} cases, seed={args.seed}, "
+    print(f"hyfuzz: {args.cases} cases, seed={args.seed}, "
           f"clean-rejects={clean_rejects}, clean-accepts={ok_accepts}")
     if failures:
         print(f"hyfuzz: {len(failures)} INVARIANT VIOLATIONS:")
