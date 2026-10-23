@@ -29,22 +29,37 @@ var (
 	deepBits     uint64              // bitmap: bit i set = stack i in use
 )
 
+func rollbackDeepStacks(upto int) {
+	for j := 0; j < upto; j++ {
+		if deepMappings[j] != nil {
+			_ = syscall.Munmap(deepMappings[j])
+			deepMappings[j] = nil
+		}
+		deepTops[j] = 0
+	}
+}
+
 func init() {
 	// Apple Silicon uses 16 KiB pages; Intel Macs use 4 KiB pages.
 	pageSize := syscall.Getpagesize()
+	if pageSize <= 0 {
+		pageSize = 4096
+	}
 	for i := 0; i < deepStacks; i++ {
 		total := deepStackSz + pageSize
 		b, err := syscall.Mmap(-1, 0, total, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
 		if err != nil {
+			rollbackDeepStacks(i)
 			panic("hybridge: mmap deep stack: " + err.Error())
 		}
 		// guard page at the bottom (stack grows down toward it)
 		if err := syscall.Mprotect(b[:pageSize], syscall.PROT_NONE); err != nil {
 			_ = syscall.Munmap(b)
+			rollbackDeepStacks(i)
 			panic("hybridge: mprotect guard page: " + err.Error())
 		}
 		deepMappings[i] = b
-		deepTops[i] = uintptr(unsafe.Pointer(&b[0])) + uintptr(total)
+		deepTops[i] = (uintptr(unsafe.Pointer(&b[0])) + uintptr(total)) &^ uintptr(15)
 	}
 }
 
@@ -66,5 +81,17 @@ func acquireDeep() int {
 
 // releaseDeep frees a pooled stack acquired by acquireDeep.
 func releaseDeep(i int) {
-	atomic.AndUint64(&deepBits, ^(uint64(1) << uint(i)))
+	if i < 0 || i >= deepStacks {
+		panic("hybridge: releaseDeep index out of range")
+	}
+	mask := uint64(1) << uint(i)
+	for {
+		old := atomic.LoadUint64(&deepBits)
+		if old&mask == 0 {
+			panic("hybridge: releaseDeep of unacquired stack")
+		}
+		if atomic.CompareAndSwapUint64(&deepBits, old, old&^mask) {
+			return
+		}
+	}
 }
