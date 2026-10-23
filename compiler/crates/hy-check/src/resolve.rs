@@ -330,6 +330,27 @@ impl<'a> Scan<'a> {
                                     );
                                 }
                                 return;
+                            } else if !self.allowed.contains(base_name)
+                                && !self.packages.contains(base_name)
+                                && !crate::foreign::is_curated_package_root(base_name)
+                                && !crate::foreign::BUILTIN_PACKAGES.contains(&base_name.as_str())
+                            {
+                                let msg = format!(
+                                    "`{}.{}` cannot be resolved — `{}` is not declared in this scope and is outside the M5 curated allowlist ({}) (HYB-E1001)",
+                                    base_name,
+                                    name,
+                                    base_name,
+                                    crate::foreign::CURATED_ALLOWLIST_DISPLAY
+                                );
+                                self.diags.push(
+                                    hy_diag::Diagnostic::error(
+                                        "HYB-E1001",
+                                        self.path.to_string(),
+                                        p.span,
+                                        msg,
+                                    ),
+                                );
+                                return;
                             }
                         }
                     }
@@ -413,6 +434,31 @@ impl<'a> Scan<'a> {
                                 .with_notes(vec![
                                     format!(
                                         "check the M4 snake_case spelling for `{}` exports (e.g. `io.eof`, `http.status_ok`)",
+                                        root
+                                    ),
+                                ]),
+                            );
+                        } else if !self.allowed.contains(root)
+                            && !self.packages.contains(root)
+                            && !crate::foreign::is_curated_package_root(root)
+                            && !crate::foreign::BUILTIN_PACKAGES.contains(&root.as_str())
+                        {
+                            self.diags.push(
+                                hy_diag::Diagnostic::error(
+                                    "HYB-E1001",
+                                    self.path.to_string(),
+                                    *span,
+                                    format!(
+                                        "`{}.{}` cannot be resolved — `{}` is not declared in this scope and is outside the M5 curated allowlist (allowlist: {}) (HYB-E1001)",
+                                        root,
+                                        name,
+                                        root,
+                                        crate::foreign::CURATED_ALLOWLIST_DISPLAY
+                                    ),
+                                )
+                                .with_notes(vec![
+                                    format!(
+                                        "declare `{}` in the file or scope before use, or import a package from the M5 curated allowlist",
                                         root
                                     ),
                                 ]),

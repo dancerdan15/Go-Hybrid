@@ -187,15 +187,12 @@ fn imported_package_prefix_allowed() {
 
 #[test]
 fn dotted_first_segment_is_package_open_world() {
-    // The emitter's contract: "unknown roots still work — they emit verbatim
-    // and get an import" (hy-emit is_package_root). Spike-10's `hex.encode`
-    // is a root the checker's foreign table never listed but that builds, so
-    // a direct ident base under `.` is exempt from E1001 on purpose — the
-    // checker cannot tell a real std/binding root from a typo'd one, and the
-    // go toolchain reports the difference exactly (`undefined: foo` vs a
-    // working import). Everything BARE stays checked.
-    accepts_without_e1001("fn main() {\n    x := foo.bar(1)\n    _ = x\n}\n");
-    accepts_without_e1001("fn main() {\n    _ = undefined_obj.field\n}\n");
+    // Issue #1131: bare unknown dotted roots (not declared in scope and not on
+    // the M5 curated allowlist) must be rejected with HYB-E1001, while usage-driven
+    // curated package roots like `hex.encode` remain accepted without an import.
+    rejects_with_e1001("fn main() {\n    x := foo.bar(1)\n    _ = x\n}\n");
+    rejects_with_e1001("fn main() {\n    _ = undefined_obj.field\n}\n");
+    accepts_without_e1001("fn main() {\n    _ = hex.encode(\"ab\")\n}\n");
 }
 
 #[test]
