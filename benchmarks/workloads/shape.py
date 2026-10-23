@@ -75,7 +75,7 @@ func loadOnce(items []string) (tokens int, chars int) {
 
 func pct(sorted []int64, p int) int64 {
 	n := len(sorted)
-	idx := (p*n + 99)/100 - 1
+	idx := (p*n+99)/100 - 1
 	if idx < 0 {
 		idx = 0
 	}
@@ -499,7 +499,7 @@ def run_self_test() -> int:
         if parse_workload_line("go", bad_line) is not None:
             raise AssertionError(f"expected None for malformed line {bad_line!r}")
 
-    if "(p*n + 99)/100 - 1" not in FILES["go/main.go"] or "p * len(sorted) / 100" in FILES["go/main.go"]:
+    if "(p*n+99)/100 - 1" not in FILES["go/main.go"] or "p * len(sorted) / 100" in FILES["go/main.go"]:
         raise AssertionError("go/main.go missing nearest-rank formula")
     for rel in ("rust/src/main.rs", "hy/load.hy", "hy/alloc.hy"):
         src = FILES[rel]
