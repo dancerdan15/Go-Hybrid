@@ -412,6 +412,7 @@ impl Emitter {
                 let main_body = std::mem::take(&mut self.body);
                 let saved_loans = std::mem::take(&mut self.loan_frames);
                 let saved_inherit = self.branch_inherit.take();
+                self.collect_fn_local_hints(body);
                 let body_res = self.emit_block_body(&body.stmts);
                 self.branch_inherit = saved_inherit;
                 self.loan_frames = saved_loans;
@@ -637,7 +638,7 @@ impl Emitter {
         self.member_name(base, name)
     }
 
-    fn unwrap_parens(mut e: &Expr) -> &Expr {
+    pub(crate) fn unwrap_parens(mut e: &Expr) -> &Expr {
         while let Expr::Paren { inner, .. } = e {
             e = inner;
         }
@@ -873,11 +874,24 @@ impl Emitter {
         // own method-receiver auto-address precedent, pinned by the
         // pre-registered corpus).
         let mut ptr_params: Vec<bool> = Vec::new();
-        if let Expr::Ident { name, .. } = callee {
-            let (fn_head, _) = split_type_args(name);
-            if let Some((_, _, _, params)) = self.fn_shapes.get(fn_head) {
-                ptr_params = params.iter().map(|p| p.is_some()).collect();
+        match Self::unwrap_parens(callee) {
+            Expr::Ident { name, .. } => {
+                let (fn_head, _) = split_type_args(name);
+                if let Some((_, _, _, params)) = self.fn_shapes.get(fn_head) {
+                    ptr_params = params.iter().map(|p| p.is_some()).collect();
+                }
             }
+            Expr::Field { base, name, .. } => {
+                let (method_name, _) = split_type_args(name);
+                if let Some(sn) = self.struct_name_of_expr(base) {
+                    if let Some((_, _, _, params)) =
+                        self.fn_shapes.get(&format!("{}::{}", sn, method_name))
+                    {
+                        ptr_params = params.iter().map(|p| p.is_some()).collect();
+                    }
+                }
+            }
+            _ => {}
         }
         let c = self.emit_expr(callee, ATOM)?;
         let mut parts = Vec::new();
@@ -886,7 +900,7 @@ impl Emitter {
             let wants_ptr = ptr_params.get(i).copied().unwrap_or(false);
             let already_ptr = self.expr_is_pointer(&a.value);
             let addressable = matches!(
-                a.value,
+                Self::unwrap_parens(&a.value),
                 Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. }
             );
             if wants_ptr && !already_ptr && addressable {

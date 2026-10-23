@@ -334,6 +334,14 @@ pub(crate) fn base_ty_name(t: &TypeExpr) -> Option<String> {
     }
 }
 
+pub(crate) fn is_pointer_element_type(ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Slice { elem: t, .. } | TypeExpr::Array { elem: t, .. } | TypeExpr::Map { value: t, .. } => matches!(t.as_ref(), TypeExpr::Pointer { .. }),
+        TypeExpr::Pointer { to, .. } => matches!(to.as_ref(), TypeExpr::Array { elem, .. } if matches!(elem.as_ref(), TypeExpr::Pointer { .. })),
+        _ => false,
+    }
+}
+
 /// Is this ident a foreign package root we recognize? (Import collection is
 /// usage-driven: any dotted name's first segment gets an import line.)
 pub(crate) fn is_package_root(name: &str) -> bool {
@@ -515,6 +523,7 @@ pub struct Emitter {
     var_ty: BTreeMap<String, (String, bool)>,
     /// Variables known to hold a pointer type in the current function frame.
     pointer_vars: BTreeSet<String>,
+    ptr_elem_vars: BTreeSet<String>,
     /// Local/parameter/receiver/result names bound in the current function frame.
     local_vars: BTreeSet<String>,
     /// Functions whose first result is a pointer type.
@@ -564,6 +573,7 @@ impl Emitter {
             var_struct: BTreeMap::new(),
             var_ty: BTreeMap::new(),
             pointer_vars: BTreeSet::new(),
+            ptr_elem_vars: BTreeSet::new(),
             local_vars: BTreeSet::new(),
             ptr_returning_fns: BTreeSet::new(),
             explicit_imports: BTreeMap::new(),
@@ -599,7 +609,6 @@ impl Emitter {
             self.local_vars.insert(name.to_string());
             self.bindings.remove(name);
             self.var_ty.remove(name);
-            self.var_struct.remove(name);
             self.pointer_vars.remove(name);
         }
     }
@@ -717,6 +726,12 @@ impl Emitter {
                 (f.name.clone(), (f.results.len(), err, kind, ptr_params))
             })
             .collect();
+        for f in file.fns() {
+            if let Some(r) = f.receiver.as_ref().and_then(|r| base_ty_name(&r.ty)) {
+                let p = f.params.iter().map(|p| matches!(p.ty, TypeExpr::Pointer { .. }).then(String::new)).collect();
+                self.fn_shapes.insert(format!("{}::{}", r.split('[').next().unwrap_or(&r), f.name), (f.results.len(), false, None, p));
+            }
+        }
 
         // Pass 1: render every declaration into the body buffer, collecting
         // used packages as we go. Top-level decls separate with a blank line
@@ -1181,6 +1196,7 @@ impl Emitter {
         self.var_struct.clear();
         self.var_ty.clear();
         self.pointer_vars.clear();
+        self.ptr_elem_vars.clear();
         self.local_vars.clear();
         self.temp_n = 0;
         self.try_temps.clear();
@@ -1319,6 +1335,7 @@ impl Emitter {
             self.in_main_closure = true;
             self.emit_hints_from_params(&f.params);
             if let Some(body) = &f.body {
+                self.collect_fn_local_hints(body);
                 // The closure-body level is already pushed above;
                 // emit_block_body adds its own, so drop one first or every
                 // wrapper body line renders one tab deeper than gofmt.
@@ -1394,6 +1411,7 @@ impl Emitter {
         // hints write no lines; no bump is needed anywhere here.
         self.emit_hints_from_params(&f.params);
         if let Some(body) = &f.body {
+            self.collect_fn_local_hints(body);
             self.emit_block_body(&body.stmts)?;
         }
         self.push("}");
@@ -1456,19 +1474,81 @@ impl Emitter {
         }
     }
 
-    pub(crate) fn expr_is_pointer(&self, e: &Expr) -> bool {
-        match e {
-            Expr::AddrOf { .. } => true,
-            Expr::Paren { inner, .. } => self.expr_is_pointer(inner),
-            Expr::Try { operand, .. } => self.expr_is_pointer(operand),
-            Expr::Ident { name, .. } => self.pointer_vars.contains(name),
-            Expr::Call { callee, .. } => {
-                if let Expr::Ident { name, .. } = callee.as_ref() {
-                    self.ptr_returning_fns.contains(name)
-                } else {
-                    false
+    pub(crate) fn collect_fn_local_hints(&mut self, b: &Block) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Local(l) => {
+                    if let Some(t) = &l.ty {
+                        l.names.iter().filter(|n| *n != "_").for_each(|n| self.register_var_ty(n, t));
+                    }
+                    for (n, v) in l.names.iter().zip(&l.values).filter(|(n, _)| *n != "_") {
+                        if self.expr_is_pointer_elem(v) {
+                            self.ptr_elem_vars.insert(n.clone());
+                        }
+                        if let Some(sn) = self.struct_name_of_expr(v) {
+                            self.var_struct.insert(n.clone(), sn);
+                        }
+                    }
                 }
+                Stmt::If { then, otherwise, .. } => {
+                    self.collect_fn_local_hints(then);
+                    if let Some(Stmt::Block { block, .. }) = otherwise.as_deref() {
+                        self.collect_fn_local_hints(block);
+                    }
+                }
+                Stmt::For { body, .. } | Stmt::Block { block: body, .. } | Stmt::Managed { body, .. } => self.collect_fn_local_hints(body),
+                Stmt::Match { arms, .. } => arms.iter().for_each(|a| self.collect_fn_local_hints(&a.body)),
+                Stmt::Select { arms, .. } => arms.iter().for_each(|a| self.collect_fn_local_hints(&a.body)),
+                _ => {}
             }
+        }
+    }
+
+    fn field_ty(&self, base: &Expr, name: &str) -> Option<&TypeExpr> {
+        let s = self.struct_name_of_expr(base)?;
+        self.n5_structs.get(&s)?.iter().find(|f| f.name == name).map(|f| &f.ty)
+    }
+
+    pub(crate) fn struct_name_of_expr(&self, e: &Expr) -> Option<String> {
+        let head = match Self::unwrap_parens(e) {
+            Expr::Ident { name, .. } => return self.var_struct.get(name).cloned(),
+            Expr::AddrOf { operand: o, .. } | Expr::Try { operand: o, .. } | Expr::Move { operand: o, .. } | Expr::Unary { operand: o, .. } => return self.struct_name_of_expr(o),
+            Expr::Field { base, name, .. } => self.struct_fields.get(&self.struct_name_of_expr(base)?)?.iter().find(|(f, _)| f == name)?.1.clone(),
+            Expr::StructLit { ty: Some(t), .. } => base_ty_name(t)?,
+            _ => return None,
+        };
+        let h = head.split('[').next().unwrap_or(&head);
+        self.struct_fields.contains_key(h).then(|| h.to_string())
+    }
+
+    pub(crate) fn expr_is_pointer_elem(&self, e: &Expr) -> bool {
+        match Self::unwrap_parens(e) {
+            Expr::Ident { name, .. } => self.ptr_elem_vars.contains(name),
+            Expr::Slice { base: b, .. } | Expr::Try { operand: b, .. } | Expr::Move { operand: b, .. } => self.expr_is_pointer_elem(b),
+            Expr::SliceLit { elem: Some(t), .. } | Expr::MapLit { value: t, .. } => matches!(Self::unwrap_parens(e).as_array_lit().map_or(t.as_ref(), |(_, el, _)| el), TypeExpr::Pointer { .. }),
+            Expr::SliceLit { elem: None, items, .. } => items.first().is_some_and(|it| self.expr_is_pointer(it)),
+            Expr::Field { base, name, .. } => self.field_ty(base, name).is_some_and(is_pointer_element_type),
+            Expr::Call { callee, args, .. } if matches!(Self::unwrap_parens(callee), Expr::Ident { name, .. } if name == "make") => {
+                args.first().is_some_and(|a| self.expr_is_pointer_elem(&a.value))
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn expr_is_pointer(&self, e: &Expr) -> bool {
+        match Self::unwrap_parens(e) {
+            Expr::AddrOf { .. } | Expr::Unary { op: UnOp::Addr, .. } => true,
+            Expr::Try { operand, .. } | Expr::Move { operand, .. } => self.expr_is_pointer(operand),
+            Expr::Ident { name, .. } => self.pointer_vars.contains(name),
+            Expr::Index { base, .. } => self.expr_is_pointer_elem(base),
+            Expr::Field { base, name, .. } => self.field_ty(base, name).is_some_and(|t| matches!(t, TypeExpr::Pointer { .. })),
+            Expr::Call { callee, .. } => match Self::unwrap_parens(callee) {
+                Expr::Ident { name, .. } | Expr::Field { name, .. } => {
+                    let head = name.split('[').next().unwrap_or(name);
+                    head == "new" || self.ptr_returning_fns.contains(head)
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -1478,6 +1558,9 @@ impl Emitter {
     /// whose type is a user struct (`pool_stats`, value or pointer) lands
     /// in var_struct — `stats.mu.lock()` types through struct_fields.
     fn register_var_ty(&mut self, name: &str, ty: &TypeExpr) {
+        if is_pointer_element_type(ty) {
+            self.ptr_elem_vars.insert(name.to_string());
+        }
         let (base, ptr) = match ty {
             TypeExpr::Pointer { to, .. } => (base_ty_name(to), true),
             t => (base_ty_name(t), false),
