@@ -42,18 +42,18 @@ impl<'a> Checker<'a> {
                 let before = self.diags.len();
                 self.check_range_iterable(st, expr, span);
                 if self.diags.len() == before {
-                    let shape = self.shape_of_expr(st, expr);
+                    let shape = self.resolved_iterable_shape(st, expr);
                     let is_chan = matches!(shape, TypeShape::Chan(_));
-                    let is_set = matches!(
-                        shape,
-                        TypeShape::Struct(Some(ref n)) if n.starts_with("set[") || n == "set"
-                    );
-                    if vars.len() > 1 && (is_chan || is_set) {
-                        let kind_str = if is_chan { "channel" } else { "set" };
-                        let why_note = if is_chan {
-                            "why: Go permits only a single iteration variable when ranging over a channel (`range over … permits only one iteration variable`), so an accepted Hybrid program would emit unbuildable Go (LX13)".to_string()
+                    let is_set = matches!(shape, TypeShape::Struct(Some(ref n)) if n.starts_with("set[") || n == "set");
+                    let is_view = matches!(shape, TypeShape::BorrowHandle(_))
+                        || matches!(shape, TypeShape::OwnHandle(ref t) if crate::foreign::is_iterable_handle(t));
+                    if vars.len() > 1 && (is_chan || is_set || is_view) {
+                        let (kind_str, why_note) = if is_chan {
+                            ("channel", "why: Go permits only a single iteration variable when ranging over a channel (`range over … permits only one iteration variable`), so an accepted Hybrid program would emit unbuildable Go (LX13)".to_string())
+                        } else if is_set {
+                            ("set", "why: ranging over a set yields elements as single values; sets permit only one iteration variable (T9)".to_string())
                         } else {
-                            "why: ranging over a set yields elements as single values; sets permit only one iteration variable (T9)".to_string()
+                            ("foreign element view", "why: ranging over a foreign element view or handle (`serde_json`) yields element views as single values and permits only one iteration variable (LX13 / O7)".to_string())
                         };
                         let msg = format!(
                             "`for {}, {} in {}` binds {} variables, but ranging over a {} yields only 1 value (HYB-E2009)",
@@ -392,7 +392,7 @@ impl<'a> Checker<'a> {
         // only pointer-to-ARRAY is rangeable (`*struct` / `*slice` /
         // `*string` are not), so normalize exactly one Pointer level for
         // arrays and leave every other shape as classified.
-        let shape = match self.shape_of_expr(st, expr) {
+        let shape = match self.resolved_iterable_shape(st, expr) {
             TypeShape::Pointer(inner) if matches!(*inner, TypeShape::Array(_)) => *inner,
             other => other,
         };
@@ -407,15 +407,7 @@ impl<'a> Checker<'a> {
             | TypeShape::BorrowHandle(_) => {}
             TypeShape::Struct(Some(ref n)) if n.starts_with("set[") || n == "set" => {}
             TypeShape::Chan(_) => {
-                let chan_ty = self.ty_of_expr(st, expr).or_else(|| {
-                    if let Expr::Ident { name, .. } = unwrap_parens(expr) {
-                        let root = crate::freeze::resolve_alias(st, name);
-                        self.lookup_binding(st, &root).and_then(|b| b.ty.clone())
-                    } else {
-                        None
-                    }
-                });
-                if let Some(ty) = chan_ty {
+                if let Some(ty) = self.resolved_iterable_type(st, expr, 0) {
                     let resolved = self.resolve_type_alias(&ty);
                     if matches!(
                         resolved,
@@ -472,6 +464,114 @@ impl<'a> Checker<'a> {
                     Diagnostic::error("HYB-E2009", self.path.clone(), span, msg).with_notes(notes),
                 );
             }
+        }
+    }
+
+    fn resolved_iterable_shape(&self, st: &FnState, expr: &Expr) -> TypeShape {
+        let raw = self.shape_of_expr(st, expr);
+        let is_alias = matches!(raw, TypeShape::Struct(Some(ref n)) if self.type_aliases.contains_key(Self::base_named_type_str(n)));
+        if !matches!(raw, TypeShape::Unknown) && !is_alias {
+            return raw;
+        }
+        if let Some(ty) = self.resolved_iterable_type(st, expr, 0) {
+            let resolved = self.resolve_type_alias(&ty);
+            if matches!(&resolved, TypeExpr::Named { name, .. } if name.starts_with("set[") || name == "set") {
+                return TypeShape::Struct(Some(resolved.render()));
+            }
+            return self.shape_of_type(&resolved);
+        }
+        raw
+    }
+
+    fn resolved_iterable_type(&self, st: &FnState, expr: &Expr, depth: usize) -> Option<TypeExpr> {
+        let mut cur = (depth <= 8).then_some(expr)?;
+        while let Expr::Paren { inner, .. } | Expr::Move { operand: inner, .. } | Expr::Try { operand: inner, .. } = cur {
+            cur = inner;
+        }
+        match cur {
+            Expr::Ident { name, .. } => {
+                let root = crate::freeze::resolve_alias(st, name);
+                let direct = self
+                    .ty_of_expr(st, cur)
+                    .or_else(|| self.lookup_binding(st, &root).and_then(|b| b.ty.clone()));
+                if let Some(ref ty) = direct {
+                    let res = self.resolve_type_alias(ty);
+                    if !matches!(self.shape_of_type(&res), TypeShape::Unknown)
+                        || matches!(&res, TypeExpr::Named { name: n, .. } if n.starts_with("set[") || n == "set")
+                    {
+                        return direct;
+                    }
+                }
+                self.file
+                    .fns()
+                    .filter_map(|f| f.body.as_ref())
+                    .flat_map(|b| crate::walk::flatten(b).stmts)
+                    .filter_map(|(s, _)| if let Stmt::Local(l) = s { Some(l) } else { None })
+                    .flat_map(|l| l.names.iter().zip(&l.values))
+                    .filter(|(n, v)| *n == &root && (v.span().end.line, v.span().end.col) <= (cur.span().start.line, cur.span().start.col))
+                    .last()
+                    .and_then(|(_, i)| self.resolved_iterable_type(st, i, depth + 1))
+                    .or(direct)
+            }
+            Expr::Lit { kind, span } if !matches!(kind, LitKind::Nil) => Some(TypeExpr::Named {
+                name: if matches!(kind, LitKind::Str(_) | LitKind::RawStr(_)) { "string" } else { "int" }.to_string(),
+                span: *span,
+            }),
+            Expr::Field { base, name, .. } => {
+                let mut peeled = self.resolve_type_alias(&self.resolved_iterable_type(st, base, depth + 1)?);
+                while let TypeExpr::Pointer { to, .. } = peeled {
+                    peeled = self.resolve_type_alias(&to);
+                }
+                let TypeExpr::Named { name: sname, .. } = &peeled else { return self.ty_of_expr(st, cur) };
+                let base_name = Self::base_named_type_str(sname);
+                let (_, fty) = self.structs.get(base_name)?.iter().find(|(n, _)| n == name)?;
+                if let (Some(tps), Some(targs)) = (self.struct_type_params.get(base_name), Self::parse_iterable_type_args(sname)) {
+                    if let Some((_, arg)) = tps.iter().zip(targs).find(|(tp, _)| {
+                        matches!(fty, TypeExpr::Named { name: fnm, .. } if fnm == &tp.name)
+                    }) {
+                        return Some(arg);
+                    }
+                }
+                Some(fty.clone())
+            }
+            Expr::Call { callee, args, .. } => match unwrap_parens(callee) {
+                Expr::Field { base, name, .. } if name == "unwrap" || name == "or" => {
+                    if let Some(TypeExpr::Option { elem, .. }) = self.resolved_iterable_type(st, base, depth + 1).map(|t| self.resolve_type_alias(&t)) {
+                        if !matches!(&*elem, TypeExpr::Named { name: n, .. } if n == "any") {
+                            return Some(*elem);
+                        }
+                    }
+                    args.first().and_then(|a| self.resolved_iterable_type(st, &a.value, depth + 1)).or_else(|| self.ty_of_expr(st, cur))
+                }
+                Expr::Ident { name, .. } if self.lookup_binding(st, name).is_none() => {
+                    let f = self.fns.get(name.as_str()).or_else(|| self.fns.get(Self::base_named_type_str(name)))?;
+                    let ret = &f.results.first()?.ty;
+                    if let TypeExpr::Named { name: ret_tp, .. } = ret {
+                        if let Some(targs) = Self::parse_iterable_type_args(name) {
+                            if let Some((_, arg)) = f.type_params.iter().zip(targs).find(|(tp, _)| &tp.name == ret_tp) {
+                                return Some(arg);
+                            }
+                        }
+                        if let Some((_, arg)) = f.params.iter().zip(args).find(|(p, _)| {
+                            matches!(&p.ty, TypeExpr::Named { name: p_tp, .. } if p_tp == ret_tp)
+                        }) {
+                            return self.resolved_iterable_type(st, &arg.value, depth + 1);
+                        }
+                    }
+                    Some(ret.clone())
+                }
+                _ => self.ty_of_expr(st, cur),
+            },
+            _ => self.ty_of_expr(st, cur),
+        }
+    }
+
+    fn parse_iterable_type_args(name: &str) -> Option<Vec<TypeExpr>> {
+        let inner = name.split_once('[')?.1.strip_suffix(']')?;
+        let file = hy_syntax::parse_file("", &format!("fn _() ({inner}) {{}}\n")).ok()?;
+        match file.decls.into_iter().next()? {
+            hy_syntax::Decl::Fn(f) => Some(f.results.into_iter().map(|r| r.ty).collect()),
+            _ => None,
         }
     }
 }
