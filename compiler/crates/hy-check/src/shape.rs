@@ -313,22 +313,26 @@ impl<'a> Checker<'a> {
 
     fn call_shape(&self, st: &FnState, callee: &Expr, args: &[CallArg]) -> TypeShape {
         match crate::model::unwrap_parens(callee) {
-            Expr::FnLit { results, .. } => results
-                .first()
-                .map(|r| self.shape_of_type(&r.ty))
-                .unwrap_or(TypeShape::Unknown),
+            Expr::FnLit { results, .. } => {
+                return results
+                    .first()
+                    .map(|r| self.shape_of_type(&r.ty))
+                    .unwrap_or(TypeShape::Unknown);
+            }
             Expr::Ident { name, .. } => {
                 // Local bindings shadow top-level functions and builtins.
                 if let Some(b) = self.lookup_binding(st, name) {
-                    if let Some(TypeExpr::Fn { results, .. }) = &b.ty {
-                        return results
-                            .first()
-                            .map(|r| self.shape_of_type(r))
-                            .unwrap_or(TypeShape::Unknown);
+                    if let Some(ty) = &b.ty {
+                        if let TypeExpr::Fn { results, .. } = self.resolve_type_alias(ty) {
+                            return results
+                                .first()
+                                .map(|r| self.shape_of_type(r))
+                                .unwrap_or(TypeShape::Unknown);
+                        }
                     }
                     return TypeShape::Unknown;
                 }
-                match name.as_str() {
+                return match name.as_str() {
                     // `make(chan T, n)` — defensive against parser spellings of
                     // the type argument; defaults Unknown (fail-closed at
                     // boundaries, O4.9). See the TECH DEBT note in foreign.rs.
@@ -391,7 +395,7 @@ impl<'a> Checker<'a> {
                             .map(|r| self.shape_of_type(&r.ty))
                             .unwrap_or(TypeShape::Unknown)
                     }
-                }
+                };
             }
             Expr::Field { base, name, .. } => {
                 // package call (`serde_json.parse`) vs method call (`doc.array`)
@@ -443,35 +447,18 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                let recv = self.shape_of_expr(st, base);
                 if let Some(t) = receiver_type_name(&recv) {
                     return foreign::method_result(&t, name);
                 }
-                let head = Self::base_named_type_str(name);
-                let recv_base = self
-                    .ty_of_expr(st, base)
-                    .map(|t| self.resolve_type_alias(&t))
-                    .and_then(|t| Self::base_named_type(&t))
-                    .or_else(|| match &recv {
-                        TypeShape::Struct(Some(s)) => {
-                            Some(Self::base_named_type_str(s).to_string())
-                        }
-                        TypeShape::Pointer(inner) => match &**inner {
-                            TypeShape::Struct(Some(s)) => {
-                                Some(Self::base_named_type_str(s).to_string())
-                            }
-                            _ => None,
-                        },
-                        _ => None,
-                    });
-                recv_base
-                    .and_then(|rb| self.method_decls.get(&(rb, head.to_string())))
-                    .and_then(|f| f.results.first())
-                    .map(|r| self.shape_of_type(&r.ty))
-                    .unwrap_or(TypeShape::Unknown)
             }
-            _ => TypeShape::Unknown,
+            _ => {}
         }
+        self.ty_of_expr(st, callee)
+            .and_then(|t| match self.resolve_type_alias(&t) {
+                TypeExpr::Fn { results, .. } => results.first().map(|r| self.shape_of_type(r)),
+                _ => None,
+            })
+            .unwrap_or(TypeShape::Unknown)
     }
 
     fn make_shape(&self, args: &[CallArg]) -> TypeShape {
@@ -629,10 +616,10 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                let base_ty = self.ty_of_expr(st, base)?;
-                let resolved = self.resolve_type_alias(&base_ty);
+                let base_ty = self.ty_of_expr(st, base);
+                let resolved = base_ty.as_ref().map(|t| self.resolve_type_alias(t));
                 if name == "pop" {
-                    if let TypeExpr::Slice { elem, .. } = &resolved {
+                    if let Some(TypeExpr::Slice { elem, .. }) = &resolved {
                         return Some(TypeExpr::Fn {
                             params: Vec::new(),
                             results: vec![(**elem).clone()],
@@ -640,7 +627,22 @@ impl<'a> Checker<'a> {
                         });
                     }
                 }
-                let sname = Self::base_named_type(&resolved)?;
+                let sname = resolved
+                    .as_ref()
+                    .and_then(Self::base_named_type)
+                    .filter(|s| self.structs.contains_key(s.as_str()))
+                    .or_else(|| match self.shape_of_expr(st, base) {
+                        TypeShape::Struct(Some(s)) => {
+                            Some(Self::base_named_type_str(&s).to_string())
+                        }
+                        TypeShape::Pointer(inner) => match *inner {
+                            TypeShape::Struct(Some(s)) => {
+                                Some(Self::base_named_type_str(&s).to_string())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })?;
                 self.structs
                     .get(&sname)
                     .and_then(|fs| fs.iter().find(|(n, _)| n == name))
@@ -654,6 +656,31 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }
             }
+            Expr::Slice { base, span, .. } => {
+                let base_ty = self.ty_of_expr(st, base)?;
+                match self.resolve_type_alias(&base_ty) {
+                    TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } => {
+                        Some(TypeExpr::Slice { elem, span: *span })
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Receive { chan, .. } => {
+                let chan_ty = self.ty_of_expr(st, chan)?;
+                match self.resolve_type_alias(&chan_ty) {
+                    TypeExpr::Chan { elem, .. } => Some(*elem),
+                    _ => None,
+                }
+            }
+            Expr::AddrOf { operand, span }
+            | Expr::Unary {
+                op: hy_syntax::UnOp::Addr,
+                operand,
+                span,
+            } => self.ty_of_expr(st, operand).map(|t| TypeExpr::Pointer {
+                to: Box::new(t),
+                span: *span,
+            }),
             Expr::StructLit { ty, .. } => ty.clone(),
             Expr::MapLit {
                 key, value, span, ..
@@ -722,8 +749,23 @@ impl<'a> Checker<'a> {
                             span: *span,
                         });
                     }
-                    if name == "make" {
+                    if name == "append" && !self.fns.contains_key("append") {
                         return args.first().and_then(|a| self.ty_of_expr(st, &a.value));
+                    }
+                    if name == "make" {
+                        return args.first().and_then(|a| {
+                            if let Expr::Ident { name: tname, span } =
+                                crate::model::unwrap_parens(&a.value)
+                            {
+                                if self.type_aliases.contains_key(tname) {
+                                    return Some(TypeExpr::Named {
+                                        name: tname.clone(),
+                                        span: *span,
+                                    });
+                                }
+                            }
+                            self.ty_of_expr(st, &a.value)
+                        });
                     }
                     if args.len() == 1 {
                         let is_type_name = crate::const_overflow::fixed_width_int_range(name).is_some()
@@ -1142,12 +1184,21 @@ impl<'a> Checker<'a> {
                             _ => None,
                         },
                         _ => None,
-                    })?;
-                self.method_decls
-                    .get(&(recv_base, head.to_string()))
-                    .map(|f| f.results.iter().map(|r| r.ty.clone()).collect())
+                    });
+                if let Some(rb) = recv_base {
+                    if let Some(f) = self.method_decls.get(&(rb, head.to_string())) {
+                        return Some(f.results.iter().map(|r| r.ty.clone()).collect());
+                    }
+                }
+                match self.resolve_type_alias(&self.ty_of_expr(st, callee)?) {
+                    TypeExpr::Fn { results, .. } => Some(results),
+                    _ => None,
+                }
             }
-            _ => None,
+            other => match self.resolve_type_alias(&self.ty_of_expr(st, other)?) {
+                TypeExpr::Fn { results, .. } => Some(results),
+                _ => None,
+            },
         }
     }
 
@@ -1210,8 +1261,17 @@ impl<'a> Checker<'a> {
         let v = crate::model::unwrap_parens(value);
         if n_names == 2 {
             if let Expr::Index { base, .. } = v {
-                if let Some(TypeExpr::Map { value: val_ty, .. }) = self.ty_of_expr(st, base) {
-                    return vec![Some(*val_ty), None];
+                if let Some(base_ty) = self.ty_of_expr(st, base) {
+                    if let TypeExpr::Map { value: val_ty, .. } = self.resolve_type_alias(&base_ty) {
+                        return vec![Some(*val_ty), None];
+                    }
+                }
+            }
+            if let Expr::Receive { chan, .. } = v {
+                if let Some(chan_ty) = self.ty_of_expr(st, chan) {
+                    if let TypeExpr::Chan { elem, .. } = self.resolve_type_alias(&chan_ty) {
+                        return vec![Some(*elem), None];
+                    }
                 }
             }
         }
