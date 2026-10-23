@@ -611,7 +611,7 @@ impl Parser {
     /// Result: bare type, or parenthesized list with optional names
     /// (`(total int, err error)` / `(int, error)` / `(code int)`).
     fn parse_results(&mut self) -> PResult<Vec<FnResult>> {
-        if self.at_punct("(") {
+        if self.at_punct("(") && self.same_line_as_prev() {
             self.bump();
             let mut results = Vec::new();
             while !self.at_punct(")") && !self.at_eof() {
@@ -635,7 +635,7 @@ impl Parser {
             }
             self.expect_punct(")")?;
             Ok(results)
-        } else if self.is_type_start() {
+        } else if self.is_type_start() && self.same_line_as_prev() {
             let ty = self.parse_type()?;
             Ok(vec![FnResult { name: None, ty }])
         } else {
@@ -734,8 +734,14 @@ impl Parser {
                 let params = self.parse_params()?;
                 self.expect_punct(")")?;
                 let mut results = Vec::new();
-                while self.is_type_start() {
-                    results.push(self.parse_type()?);
+                if self.at_punct("(") && self.same_line_as_prev() {
+                    for r in self.parse_results()? {
+                        results.push(r.ty);
+                    }
+                } else {
+                    while self.is_type_start() && self.same_line_as_prev() {
+                        results.push(self.parse_type()?);
+                    }
                 }
                 TypeExpr::Fn {
                     params,
