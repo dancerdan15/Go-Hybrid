@@ -205,15 +205,11 @@ fn walk_one<'a>(out: &mut FlatInfo<'a>, stmt: &'a Stmt, named_results: &[String]
                 for s in &arm.body.stmts {
                     if !ran {
                         out.mark_event(first, ScopeEvent::Push);
-                        if let hy_syntax::MatchPattern::Path {
-                            binding: Some(name),
-                            ..
-                        } = &arm.pattern
-                        {
+                        if let Some(name) = match_pattern_bound_name(&arm.pattern) {
                             out.mark_event(
                                 first,
                                 ScopeEvent::MatchBind {
-                                    name: name.as_str(),
+                                    name,
                                     subject,
                                 },
                             );
@@ -353,12 +349,7 @@ pub(crate) fn own_uses_with_results(stmt: &Stmt, named_results: &[String], out: 
             expr_uses(subject, out);
             for arm in arms {
                 if let Some(g) = &arm.guard {
-                    let bound_name = match &arm.pattern {
-                        hy_syntax::MatchPattern::Path {
-                            binding: Some(n), ..
-                        } => Some(n.as_str()),
-                        _ => None,
-                    };
+                    let bound_name = match_pattern_bound_name(&arm.pattern);
                     let mut g_uses = Vec::new();
                     expr_uses(g, &mut g_uses);
                     for u in g_uses {
@@ -439,6 +430,20 @@ pub(crate) fn expr_uses(expr: &Expr, out: &mut Vec<Use>) {
                 via_move: false,
                 via_addr: true,
             }),
+            Expr::Index { .. } | Expr::Slice { .. } => {
+                if let Some(root) = operand.root_ident() {
+                    out.push(Use {
+                        name: root.to_string(),
+                        span: *span,
+                        is_write: false,
+                        via_move: false,
+                        via_addr: true,
+                    });
+                    collect_projection_index_uses(operand, out);
+                } else {
+                    expr_uses(operand, out);
+                }
+            }
             _ => expr_uses(operand, out),
         },
         Expr::Unary { operand, .. } => expr_uses(operand, out),
@@ -508,6 +513,52 @@ pub(crate) fn expr_uses(expr: &Expr, out: &mut Vec<Use>) {
         // closures.rs pass (O4.9).
         Expr::FnLit { .. } => {}
         Expr::Paren { inner, .. } => expr_uses(inner, out),
+    }
+}
+
+fn match_pattern_bound_name(pat: &hy_syntax::MatchPattern) -> Option<&str> {
+    match pat {
+        hy_syntax::MatchPattern::Path {
+            binding: Some(bname),
+            ..
+        } if bname != "_" => Some(bname.as_str()),
+        hy_syntax::MatchPattern::Path {
+            segments,
+            binding: None,
+        } if segments.len() == 1
+            && segments[0].starts_with(|c: char| c.is_ascii_lowercase())
+            && !matches!(
+                segments[0].as_str(),
+                "none" | "some" | "true" | "false" | "nil"
+            ) =>
+        {
+            Some(segments[0].as_str())
+        }
+        _ => None,
+    }
+}
+
+fn collect_projection_index_uses(e: &Expr, out: &mut Vec<Use>) {
+    match e {
+        Expr::Paren { inner, .. }
+        | Expr::Field { base: inner, .. }
+        | Expr::Try { operand: inner, .. }
+        | Expr::AddrOf { operand: inner, .. }
+        | Expr::Unary { operand: inner, .. } => collect_projection_index_uses(inner, out),
+        Expr::Index { base, index, .. } => {
+            collect_projection_index_uses(base, out);
+            expr_uses(index, out);
+        }
+        Expr::Slice { base, lo, hi, .. } => {
+            collect_projection_index_uses(base, out);
+            if let Some(l) = lo {
+                expr_uses(l, out);
+            }
+            if let Some(h) = hi {
+                expr_uses(h, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -832,13 +883,25 @@ pub(crate) fn expr_path(expr: &Expr) -> Option<String> {
 /// an index-free ident/field chain, so two different keys on the same base
 /// are provably distinct slots. `None` means the slot may be any slot.
 pub(crate) fn addr_of_index_slot_key(value: &Expr) -> Option<String> {
-    let Expr::Index { base, index, .. } = as_addr_of(value)? else {
-        return None;
-    };
+    let (base, index) = peel_slot_loan_index(value)?;
     if !expr_is_index_free(base) {
         return None;
     }
     lit_index_key(index)
+}
+
+fn peel_slot_loan_index(mut value: &Expr) -> Option<(&Expr, &Expr)> {
+    while let Expr::Paren { inner, .. } | Expr::Move { operand: inner, .. } = value {
+        value = inner;
+    }
+    let mut cur = as_addr_of(value)?;
+    loop {
+        match cur {
+            Expr::Index { base, index, .. } => return Some((base, index)),
+            Expr::Field { base, .. } | Expr::Paren { inner: base, .. } => cur = base,
+            _ => return None,
+        }
+    }
 }
 
 /// A field store `s[k].f = v` (or `s[k].f.g op= v`) writes into one slot of
@@ -891,9 +954,6 @@ fn place_is_index_free(p: &Place) -> bool {
 /// `svc := &e.services[existing]` — extract (defined-name-agnostic) the base
 /// path of an `&path[key]`-shaped value, if it is one.
 pub(crate) fn addr_of_index_base_path(value: &Expr) -> Option<String> {
-    let operand = as_addr_of(value)?;
-    match operand {
-        Expr::Index { base, .. } => expr_path(base),
-        _ => None,
-    }
+    let (base, _) = peel_slot_loan_index(value)?;
+    expr_path(base)
 }
