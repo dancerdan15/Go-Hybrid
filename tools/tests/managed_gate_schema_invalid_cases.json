@@ -1,0 +1,17 @@
+[
+  {"name": "missing_version", "baseline": {"blocks": {}}, "diagnostic": "baseline version must be 1"},
+  {"name": "version_two", "baseline": {"version": 2, "blocks": {}}, "diagnostic": "baseline version must be 1"},
+  {"name": "version_bool_true", "baseline": {"version": true, "blocks": {}}, "diagnostic": "baseline version must be 1"},
+  {"name": "version_string", "baseline": {"version": "1", "blocks": {}}, "diagnostic": "baseline version must be 1"},
+  {"name": "key_missing_colon", "baseline": {"version": 1, "blocks": {"prog.hy": {"reason": "r"}}}, "diagnostic": "malformed baseline key"},
+  {"name": "key_non_digit_line", "baseline": {"version": 1, "blocks": {"prog.hy:abc": {"reason": "r"}}}, "diagnostic": "malformed baseline key"},
+  {"name": "key_empty_prog", "baseline": {"version": 1, "blocks": {":10": {"reason": "r"}}}, "diagnostic": "malformed baseline key"},
+  {"name": "key_dot_prog", "baseline": {"version": 1, "blocks": {".:10": {"reason": "r"}}}, "diagnostic": "malformed baseline key"},
+  {"name": "entry_not_dict", "baseline": {"version": 1, "blocks": {"prog.hy:1": "not-a-dict"}}, "diagnostic": "malformed baseline entry"},
+  {"name": "entry_missing_reason", "baseline": {"version": 1, "blocks": {"prog.hy:1": {"category": "other"}}}, "diagnostic": "malformed baseline entry"},
+  {"name": "entry_non_string_reason", "baseline": {"version": 1, "blocks": {"prog.hy:1": {"reason": 123}}}, "diagnostic": "malformed baseline entry"},
+  {"name": "entry_invalid_category", "baseline": {"version": 1, "blocks": {"prog.hy:1": {"reason": "r", "category": "bogus"}}}, "diagnostic": "malformed baseline entry"},
+  {"name": "entry_tickets_not_list", "baseline": {"version": 1, "blocks": {"prog.hy:1": {"reason": "r", "tickets": "HY-1"}}}, "diagnostic": "malformed baseline entry"},
+  {"name": "entry_tickets_non_str_item", "baseline": {"version": 1, "blocks": {"prog.hy:1": {"reason": "r", "tickets": [123]}}}, "diagnostic": "malformed baseline entry"},
+  {"name": "duplicate_normalized_key", "baseline": {"version": 1, "blocks": {"./prog.hy:1": {"reason": "a"}, "prog.hy:1": {"reason": "b"}}}, "diagnostic": "duplicate normalized baseline key"}
+]

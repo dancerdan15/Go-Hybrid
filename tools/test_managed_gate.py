@@ -318,6 +318,89 @@ class ManagedGateTests(unittest.TestCase):
                         self.assertIn('rebaseline:' if rebaseline else 'managed gate: PASS',
                                       output.getvalue())
 
+    FIXTURES = pathlib.Path(__file__).parent / 'tests'
+
+    def test_lexical_false_positives_ignored_by_scan_and_audit(self):
+        fixture = json.loads(
+            (self.FIXTURES / 'managed_gate_lexical_false_positives.json').read_text(encoding='utf-8')
+        )
+        for src in fixture['non_block_sources']:
+            with self.subTest(src=src):
+                self.assertEqual(gate.scan_managed_lines(src), [])
+                self.assertEqual(self.audit(src, []), {})
+
+        mixed_src = '\n'.join(fixture['mixed_source'])
+        self.assertEqual(gate.scan_managed_lines(mixed_src), fixture['mixed_expected_lines'])
+        found = self.audit(
+            mixed_src,
+            [{'reason': 'first', 'category': 'interop'}, {'reason': 'second', 'category': 'mutex'}],
+        )
+        self.assertEqual([k.rsplit(':', 1)[1] for k in found], ['6', '9'])
+
+    def test_path_normalization_deduplicates_progs_and_prevents_orphan_baseline_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = pathlib.Path(directory) / 'baseline.json'
+            baseline.write_text(
+                json.dumps({'version': 1, 'blocks': {'./prog.hy:1': block('reviewed'), 'other.hy:5': block('keep')}}),
+                encoding='utf-8',
+            )
+            audit_result = {'./prog.hy:1': block('reviewed')}
+            output = io.StringIO()
+            argv = ['managed_gate.py', 'hyb', str(baseline), './prog.hy', 'prog.hy']
+            with patch.object(gate.sys, 'argv', argv), \
+                 patch.object(gate, 'audit', return_value=audit_result) as mock_audit, \
+                 contextlib.redirect_stdout(output):
+                gate.main()
+            mock_audit.assert_called_once_with('hyb', 'prog.hy')
+            self.assertIn('managed gate: PASS (1 block(s), baseline 2)', output.getvalue())
+
+            updated_result = {'prog.hy:2': block('moved')}
+            rebaseline_out = io.StringIO()
+            rebaseline_argv = ['managed_gate.py', '--rebaseline', 'hyb', str(baseline), './prog.hy', 'prog.hy']
+            with patch.object(gate.sys, 'argv', rebaseline_argv), \
+                 patch.object(gate, 'audit', return_value=updated_result) as mock_rebaseline_audit, \
+                 contextlib.redirect_stdout(rebaseline_out):
+                gate.main()
+            mock_rebaseline_audit.assert_called_once_with('hyb', 'prog.hy')
+            saved_blocks = json.loads(baseline.read_text(encoding='utf-8'))['blocks']
+            self.assertEqual(saved_blocks, {'prog.hy:2': block('moved'), 'other.hy:5': block('keep')})
+            self.assertNotIn('./prog.hy:1', saved_blocks)
+
+    def test_schema_invalid_baselines_fail_closed_before_audit(self):
+        cases = json.loads(
+            (self.FIXTURES / 'managed_gate_schema_invalid_cases.json').read_text(encoding='utf-8')
+        )
+        for case in cases:
+            with self.subTest(case=case['name']):
+                self.assert_invalid_baseline(
+                    json.dumps(case['baseline']).encode('utf-8'),
+                    case['diagnostic'],
+                )
+
+    def test_valid_schema_with_optional_category_and_tickets_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = pathlib.Path(directory) / 'baseline.json'
+            entry = {'reason': 'ffi call', 'category': 'interop', 'tickets': ['HY-101', 'HY-102']}
+            baseline.write_text(
+                json.dumps({'version': 1, 'blocks': {'prog.hy:1': entry}}),
+                encoding='utf-8',
+            )
+            output = io.StringIO()
+            with patch.object(gate.sys, 'argv', ['managed_gate.py', 'hyb', str(baseline), 'prog.hy']), \
+                 patch.object(gate, 'audit', return_value={'prog.hy:1': entry}), \
+                 contextlib.redirect_stdout(output):
+                gate.main()
+            self.assertIn('managed gate: PASS (1 block(s), baseline 1)', output.getvalue())
+
+    def test_audit_missing_or_non_string_reason_fails_closed(self):
+        for bad_block in ({'category': 'other'}, {'category': 'other', 'reason': None}, {'category': 'other', 'reason': 99}):
+            with self.subTest(bad_block=bad_block):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as error:
+                    self.audit('managed("a", "other") {}', [bad_block])
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn('GATE ERROR:', output.getvalue())
+
 
 class AtomicBaselineTests(unittest.TestCase):
     def setUp(self):
@@ -343,7 +426,7 @@ class AtomicBaselineTests(unittest.TestCase):
     def test_success_replaces_complete_json_and_preserves_mode(self):
         self.rebaseline()
         self.assertEqual(json.loads(self.baseline.read_text())["blocks"], self.current)
-        self.assertEqual(self.baseline.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.baseline.stat().st_mode & 0o777, 0o640 if os.name == "posix" else 0o666)
         self.assertEqual(list(self.root.iterdir()), [self.baseline])
 
     def test_replace_failure_preserves_original_and_removes_temporary_file(self):

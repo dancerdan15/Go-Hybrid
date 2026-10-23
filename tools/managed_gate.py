@@ -79,16 +79,28 @@ def _mask_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
+_MANAGED_HEADER_RE = re.compile(r"(?<!\.)\bmanaged\s*\([\s,]*\)\s*\{")
+_NON_STMT_PREFIX_RE = re.compile(r"(?:\.|\bfn(?:\s*\([^)]*\))?)\s*$")
+
+
+def _norm_prog(path: str) -> str:
+    if os.path.splitdrive(path)[0]:
+        return os.path.normpath(path)
+    return os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+
+
 def scan_managed_lines(src: str) -> list[int]:
     """Return 1-based line numbers of lexical `managed (` occurrences outside comments/strings."""
     masked = _mask_comments_and_strings(src)
     return [
         1 + masked.count("\n", 0, m.start())
-        for m in re.finditer(r"\bmanaged\s*\(", masked)
+        for m in _MANAGED_HEADER_RE.finditer(masked)
+        if not _NON_STMT_PREFIX_RE.search(masked, 0, m.start())
     ]
 
 
 def audit(hyb, prog):
+    prog = _norm_prog(prog)
     r = subprocess.run(
         [hyb, "check", prog, "--json", "--report-managed"],
         capture_output=True, text=True, timeout=120,
@@ -123,8 +135,9 @@ def audit(hyb, prog):
     blocks = []
     for b in reported:
         category = b.get("category") if isinstance(b, dict) else None
-        if not isinstance(category, str) or category not in VALID:
-            print(f"GATE ERROR: {prog}: category {category!r} outside the closed set")
+        reason = b.get("reason") if isinstance(b, dict) else None
+        if not isinstance(category, str) or category not in VALID or not isinstance(reason, str):
+            print(f"GATE ERROR: {prog}: category {category!r} outside the closed set or missing reason")
             sys.exit(2)
         blocks.append(b)
     # line numbers: lexically scan the source for `managed (` tokens outside
@@ -180,14 +193,42 @@ def main():
         print(f"GATE ERROR: {baseline_path}: baseline must be a JSON object, got {type(baseline).__name__}")
         sys.exit(2)
 
-    base = baseline.setdefault("blocks", {})
-    if not isinstance(base, dict):
-        print(f"GATE ERROR: {baseline_path}: baseline blocks must be a JSON object, got {type(base).__name__}")
+    version = baseline.get("version")
+    if type(version) is not int or version != 1:
+        print(f"GATE ERROR: {baseline_path}: baseline version must be 1, got {version!r}")
         sys.exit(2)
 
+    raw_base = baseline.setdefault("blocks", {})
+    if not isinstance(raw_base, dict):
+        print(f"GATE ERROR: {baseline_path}: baseline blocks must be a JSON object, got {type(raw_base).__name__}")
+        sys.exit(2)
+
+    base = {}
+    for k, v in raw_base.items():
+        prog_part, sep, line_part = k.rpartition(":") if isinstance(k, str) else ("", "", "")
+        norm_prog = _norm_prog(prog_part) if prog_part else ""
+        if not sep or not norm_prog or norm_prog == "." or not line_part.isdigit():
+            print(f"GATE ERROR: {baseline_path}: malformed baseline key {k!r}")
+            sys.exit(2)
+        if (not isinstance(v, dict) or not isinstance(v.get("reason"), str)
+                or ("category" in v and (not isinstance(v["category"], str) or v["category"] not in VALID))
+                or ("tickets" in v and (not isinstance(v["tickets"], list)
+                                        or not all(isinstance(t, str) for t in v["tickets"])))):
+            print(f"GATE ERROR: {baseline_path}: malformed baseline entry at {k!r}")
+            sys.exit(2)
+        norm_k = f"{norm_prog}:{line_part}"
+        if norm_k in base:
+            print(f"GATE ERROR: {baseline_path}: duplicate normalized baseline key {norm_k!r}")
+            sys.exit(2)
+        base[norm_k] = v
+    baseline["blocks"] = base
+
+    progs = list(dict.fromkeys(_norm_prog(p) for p in progs))
     current = {}
     for prog in progs:
-        current.update(audit(hyb, prog))
+        for k, v in audit(hyb, prog).items():
+            prog_part, sep, line_part = k.rpartition(":")
+            current[f"{_norm_prog(prog_part)}:{line_part}" if sep else k] = v
 
     # pr-434: scope the whole decision to the programs actually audited in
     # this run. Baseline blocks belonging to unaudited programs are neither
