@@ -48,6 +48,35 @@ class TestAlgebraicEffectReplaySandbox(unittest.TestCase):
         ])
         self.assertEqual(ers.audit_deterministic_source(pure), [])
 
+    def test_audit_is_scoped_to_deterministic_block_bodies(self) -> None:
+        src = "\n".join([
+            "fn before() { let t = time.Now() }",
+            "deterministic(seed: 0x42) {",
+            "    for i in xs { if i { let u = time.Now() } }",
+            "}",
+            "fn after() { let r = rand.Intn(3) }",
+        ])
+        diags = ers.audit_deterministic_source(src)
+        self.assertEqual([d.line for d in diags], [3])
+        self.assertIn("inside certified deterministic block", diags[0].message)
+        self.assertEqual(ers.audit_deterministic_source("fn main() { let t = time.Now() }"), [])
+        self.assertEqual(ers.audit_deterministic_source("deterministic { let ok = 1 }\nfn f() { time.Now() }"), [])
+        whole = ers.audit_deterministic_source(src, whole_file=True)
+        self.assertEqual([d.line for d in whole], [1, 3, 5])
+        for d in whole:
+            self.assertIn("whole-file", d.message)
+            self.assertNotIn("inside certified", d.message)
+        self.assertEqual(len(ers.audit_deterministic_source("deterministic {\n  time.Now()")), 1)
+
+    def test_adversarial_jitter_is_live_with_negative_control(self) -> None:
+        pinned = "4e8e0ae5a2b34b08966ee63b7e9cb1fef7b3b4a845a82ff30fa02bd06c68e338"
+        base = ers.run_worker_pool_sandbox(0x42, jitter=0)
+        self.assertEqual(base.trace_sha256, pinned)
+        jit = [k * 97 for k in range(1, 17)]
+        self.assertTrue(all(ers.run_worker_pool_sandbox(0x42, j, canonical_order=True).trace_sha256 == pinned for j in jit))
+        ref = ers.run_worker_pool_sandbox(0x42, 0, canonical_order=False).trace_sha256
+        self.assertTrue(any(ers.run_worker_pool_sandbox(0x42, j, canonical_order=False).trace_sha256 != ref for j in jit))
+
     def test_splitmix64_reproducibility_and_seed_sensitivity(self) -> None:
         a, b, c = ers.SplitMix64(0x42), ers.SplitMix64(0x42), ers.SplitMix64(0x43)
         seq_a = [a.next_u64() for _ in range(16)]
@@ -123,6 +152,8 @@ class TestAlgebraicEffectReplaySandbox(unittest.TestCase):
         rep = ers.verify_replay_invariance(0x42, runs=8)
         self.assertEqual(rep["replay_identical_ratio"], 1.0)
         self.assertTrue(rep["seed_sensitivity_verified"])
+        self.assertTrue(rep["jitter_is_live"])
+        self.assertGreater(rep["jitter_negative_control_diverged"], 0)
         self.assertEqual(rep["deadlock_witness_code"], "HYB-E6021")
 
         repo_root = Path(__file__).resolve().parents[3]

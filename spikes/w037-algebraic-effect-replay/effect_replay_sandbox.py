@@ -33,28 +33,47 @@ def parse_deterministic_header(source: str) -> int | None:
     m = re.search(r"\bdeterministic\s*(?:\(\s*seed\s*:\s*(0x[0-9a-fA-F]+|\d+)\s*\))?\s*\{", source)
     return (int(m.group(1), 0) if m.group(1) else 0) if m else None
 
-def audit_deterministic_source(source: str) -> list[Diagnostic]:
+_DET_HEADER = re.compile(r"\bdeterministic\s*(?:\(\s*seed\s*:\s*(?:0x[0-9a-fA-F]+|\d+)\s*\))?\s*\{")
+
+def _block_body_spans(clean: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for m in _DET_HEADER.finditer(clean):
+        depth, end = 0, len(clean)
+        for i in range(m.end() - 1, len(clean)):
+            depth += (clean[i] == "{") - (clean[i] == "}")
+            if depth == 0: end = i; break
+        spans.append((m.end(), end))
+    return spans
+
+def audit_deterministic_source(source: str, whole_file: bool = False) -> list[Diagnostic]:
     clean = re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: " " + "\n" * m.group(0).count("\n"), source, flags=re.S)
     map_vars = set(re.findall(r"\b(\w+)\s*(?::=|=|:|\s)\s*(?:make\s*\(\s*)?map\[", clean)) - {"fn", "var", "let", "const", "type", "return"}
+    spans, where = _block_body_spans(clean), ("(whole-file scan, not scoped to a deterministic block)" if whole_file else "inside certified deterministic block")
     hits: list[tuple[int, Diagnostic]] = []
     for pat, sym, reason in _FORBIDDEN:
-        for m in pat.finditer(clean): hits.append((m.start(), Diagnostic("HYB-E6020", clean.count("\n", 0, m.start()) + 1, sym, f"{reason} inside certified deterministic block")))
+        for m in pat.finditer(clean): hits.append((m.start(), Diagnostic("HYB-E6020", clean.count("\n", 0, m.start()) + 1, sym, f"{reason} {where}")))
     for m in re.finditer(r"\bfor\s+\w+(?:\s*,\s*\w+)?\s+in\s+(\w+)\b", clean):
-        if m.group(1) in map_vars: hits.append((m.start(), Diagnostic("HYB-E6020", clean.count("\n", 0, m.start()) + 1, f"for..in {m.group(1)}", "unseeded map iteration inside certified deterministic block")))
-    return [d for _, d in sorted(hits, key=lambda x: x[0])]
+        if m.group(1) in map_vars: hits.append((m.start(), Diagnostic("HYB-E6020", clean.count("\n", 0, m.start()) + 1, f"for..in {m.group(1)}", f"unseeded map iteration {where}")))
+    return [d for pos, d in sorted(hits, key=lambda x: x[0]) if whole_file or any(s <= pos < e for s, e in spans)]
 
 class _Chan:
     def __init__(self, name: str, cap: int) -> None:
         self.name, self.cap, self.closed, self.buf, self.send_q, self.recv_q = name, cap, False, [], [], []
 
+def _shuffle_dict(d: dict[Any, Any], rng: SplitMix64) -> None:
+    items = list(d.items())
+    for i in range(len(items) - 1, 0, -1): j = rng.choice_index(i + 1); items[i], items[j] = items[j], items[i]
+    d.clear(); d.update(items)
+
 class DeterministicSandbox:
-    def __init__(self, seed: int = 0x42, trace: bool = True) -> None:
-        self.seed, self.prng, self.channels, self.trace = seed & 0xFFFFFFFFFFFFFFFF, SplitMix64(seed), {}, trace
+    def __init__(self, seed: int = 0x42, trace: bool = True, canonical_order: bool = True) -> None:
+        self.seed, self.prng, self.channels, self.trace, self.canonical_order = seed & 0xFFFFFFFFFFFFFFFF, SplitMix64(seed), {}, trace, canonical_order
     def make_chan(self, name: str, capacity: int = 0) -> str:
         self.channels[name] = _Chan(name, capacity); return name
     def run(self, main_fn: Callable[[], Generator[Any, Any, Any]], adversarial_jitter: int = 0) -> ReplayCertificate:
         tasks, ready = {"main": main_fn()}, {"main": (0, None)}
         sleeping, blocked, select_wait, events = {}, {}, {}, []
+        jrng = SplitMix64(adversarial_jitter) if adversarial_jitter else None  # host-side stream, never self.prng
         lambda_step = vtime = completed = 0; spawn_seq, main_result = 1, None
         def _recv(ch: _Chan) -> tuple[Any, bool] | None:
             if ch.buf:
@@ -77,9 +96,11 @@ class DeterministicSandbox:
             for stid in sorted(list(select_wait)):
                 out = _try_sel(select_wait[stid][0])
                 if out is not None: select_wait.pop(stid); blocked.pop(stid, None); ready[stid] = (vtime, out)
+        def _due() -> list[str]: return sorted(tid for tid, (rt, _) in ready.items() if rt <= vtime) if self.canonical_order else [tid for tid, (rt, _) in ready.items() if rt <= vtime]
         while len(tasks) > completed:
-            if adversarial_jitter: _ = (adversarial_jitter ^ lambda_step) * 0x9E3779B9
-            due = sorted(tid for tid, (rt, _) in ready.items() if rt <= vtime)
+            if jrng is not None:
+                for d in (ready, sleeping, select_wait, blocked): _shuffle_dict(d, jrng)
+            due = _due()
             if not due:
                 nts = [rt for rt, _ in ready.values()] + list(sleeping.values()) + [dl for _, dl in select_wait.values() if dl is not None]
                 if not nts:
@@ -88,7 +109,7 @@ class DeterministicSandbox:
                 vtime = min(nts)
                 for stid in sorted(t for t, wt in sleeping.items() if wt <= vtime): sleeping.pop(stid); ready[stid] = (vtime, None)
                 for stid in sorted(t for t, (_, dl) in select_wait.items() if dl is not None and dl <= vtime): select_wait.pop(stid); blocked.pop(stid, None); ready[stid] = (vtime, (-1, (None, False)))
-                due = sorted(tid for tid, (rt, _) in ready.items() if rt <= vtime)
+                due = _due()
             chosen = due[self.prng.choice_index(len(due)) if self.trace else 0]
             _, send_val = ready.pop(chosen); lambda_step += 1
             try: eff = tasks[chosen].send(send_val)
@@ -130,8 +151,8 @@ class DeterministicSandbox:
         digest = hashlib.sha256("\n".join(events).encode()).hexdigest() if self.trace else ""
         return ReplayCertificate(self.seed, lambda_step, vtime, spawn_seq, completed, digest, tuple(events), main_result, None)
 
-def run_worker_pool_sandbox(seed: int = 0x42, jitter: int = 0, trace: bool = True) -> ReplayCertificate:
-    sb = DeterministicSandbox(seed, trace=trace); sb.make_chan("jobs", 16); sb.make_chan("results", 16); inputs = (3, 1, 4, 1, 5, 9, 2, 6)
+def run_worker_pool_sandbox(seed: int = 0x42, jitter: int = 0, trace: bool = True, canonical_order: bool = True) -> ReplayCertificate:
+    sb = DeterministicSandbox(seed, trace=trace, canonical_order=canonical_order); sb.make_chan("jobs", 16); sb.make_chan("results", 16); inputs = (3, 1, 4, 1, 5, 9, 2, 6)
     def worker(wid: int) -> Generator[Any, Any, None]:
         while (res := (yield ChanRecv("jobs")))[1]: yield Sleep(res[0][1]); yield ChanSend("results", (wid, res[0][0] * 2))
     def main() -> Generator[Any, Any, list[int]]:
@@ -142,8 +163,8 @@ def run_worker_pool_sandbox(seed: int = 0x42, jitter: int = 0, trace: bool = Tru
         return sorted(got)
     return sb.run(main, adversarial_jitter=jitter)
 
-def run_pipeline_backpressure_sandbox(seed: int = 0x42, jitter: int = 0) -> ReplayCertificate:
-    sb = DeterministicSandbox(seed); sb.make_chan("raw", 2); sb.make_chan("sq", 2)
+def run_pipeline_backpressure_sandbox(seed: int = 0x42, jitter: int = 0, canonical_order: bool = True) -> ReplayCertificate:
+    sb = DeterministicSandbox(seed, canonical_order=canonical_order); sb.make_chan("raw", 2); sb.make_chan("sq", 2)
     def producer() -> Generator[Any, Any, None]:
         for i in range(1, 9): yield ChanSend("raw", i)
         yield ChanClose("raw")
@@ -164,26 +185,28 @@ def run_deadlock_sandbox(seed: int = 0x42) -> ReplayCertificate:
 
 def verify_replay_invariance(seed: int = 0x42, runs: int = 64) -> dict[str, Any]:
     b_wp, b_pb, alt_wp, dl = run_worker_pool_sandbox(seed), run_pipeline_backpressure_sandbox(seed), run_worker_pool_sandbox(seed ^ 1), run_deadlock_sandbox(seed)
-    wp_m = sum(1 for r in range(runs) if run_worker_pool_sandbox(seed, r * 97).trace_sha256 == b_wp.trace_sha256)
-    pb_m = sum(1 for r in range(runs) if run_pipeline_backpressure_sandbox(seed, r * 131).trace_sha256 == b_pb.trace_sha256)
+    wp_m = sum(1 for r in range(runs) if run_worker_pool_sandbox(seed, (r + 1) * 97).trace_sha256 == b_wp.trace_sha256)
+    pb_m = sum(1 for r in range(runs) if run_pipeline_backpressure_sandbox(seed, (r + 1) * 131).trace_sha256 == b_pb.trace_sha256)
+    ref = run_worker_pool_sandbox(seed, 0, canonical_order=False).trace_sha256
+    neg = sum(1 for r in range(runs) if run_worker_pool_sandbox(seed, (r + 1) * 97, canonical_order=False).trace_sha256 != ref)
     t0 = time.perf_counter_ns()
     for _ in range(64): run_worker_pool_sandbox(seed, trace=False)
     base_ns = max(1, time.perf_counter_ns() - t0); t1 = time.perf_counter_ns()
     for _ in range(64): run_worker_pool_sandbox(seed, trace=True)
     cert_ns = max(1, time.perf_counter_ns() - t1)
-    return {"seed": hex(seed), "runs": runs, "worker_pool_matches": wp_m, "pipeline_matches": pb_m, "replay_identical_ratio": (wp_m + pb_m) / (2 * runs), "worker_pool_sha256": b_wp.trace_sha256, "worker_pool_steps": b_wp.lambda_steps, "worker_pool_output": b_wp.result, "pipeline_sha256": b_pb.trace_sha256, "pipeline_steps": b_pb.lambda_steps, "pipeline_total": b_pb.result, "seed_sensitivity_verified": alt_wp.trace_sha256 != b_wp.trace_sha256, "deadlock_witness_code": dl.deadlock.code if dl.deadlock else None, "deadlock_blocked_tasks": len(dl.deadlock.blocked_tasks) if dl.deadlock else 0, "overhead_ratio": round(cert_ns / base_ns, 2)}
+    return {"seed": hex(seed), "runs": runs, "worker_pool_matches": wp_m, "pipeline_matches": pb_m, "replay_identical_ratio": (wp_m + pb_m) / (2 * runs), "worker_pool_sha256": b_wp.trace_sha256, "worker_pool_steps": b_wp.lambda_steps, "worker_pool_output": b_wp.result, "pipeline_sha256": b_pb.trace_sha256, "pipeline_steps": b_pb.lambda_steps, "pipeline_total": b_pb.result, "seed_sensitivity_verified": alt_wp.trace_sha256 != b_wp.trace_sha256, "deadlock_witness_code": dl.deadlock.code if dl.deadlock else None, "deadlock_blocked_tasks": len(dl.deadlock.blocked_tasks) if dl.deadlock else 0, "jitter_negative_control_diverged": neg, "jitter_is_live": neg > 0, "overhead_ratio": round(cert_ns / base_ns, 2), "overhead_basis": "python trace=True vs trace=False (no Go baseline; trace=False also disables the schedule PRNG)"}
 
 def audit_live_corpus(repo_root: pathlib.Path) -> dict[str, Any]:
     files = sorted(list(repo_root.glob("examples/**/*.hy")) + list(repo_root.glob("tests/checker-corpus/*.hy")))
     conc = [f.relative_to(repo_root).as_posix() for f in files if re.search(r"\b(?:task|chan|select)\b", f.read_text(encoding="utf-8"))]
-    imp = {f.relative_to(repo_root).as_posix() for f in files if audit_deterministic_source(f.read_text(encoding="utf-8"))}
-    return {"total_hy_files": len(files), "concurrent_files": len(conc), "impure_rejected_files": len(imp), "deterministic_ready_concurrent": len([c for c in conc if c not in imp])}
+    imp = {f.relative_to(repo_root).as_posix() for f in files if audit_deterministic_source(f.read_text(encoding="utf-8"), whole_file=True)}
+    return {"scan_scope": "whole-file regex (no corpus file contains a deterministic block; nothing is executed)", "total_hy_files": len(files), "concurrent_files": len(conc), "impure_rejected_files": len(imp), "deterministic_ready_concurrent": len([c for c in conc if c not in imp])}
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="W-037 Algebraic Effect Replay Sandbox (#957)")
     ap.add_argument("--check", action="store_true"); ap.add_argument("--json", action="store_true"); args = ap.parse_args(argv)
     rep, corp = verify_replay_invariance(0x42, 64), audit_live_corpus(pathlib.Path(__file__).resolve().parents[2])
     print(json.dumps({"issue": 957, "spike": "w037-algebraic-effect-replay", "replay": rep, "corpus": corp}, indent=2) if args.json else f"W-037 (#957): replay={rep['replay_identical_ratio']*100:.1f}% sha256={rep['worker_pool_sha256'][:12]} corpus={corp['total_hy_files']}")
-    return 1 if args.check and (rep["replay_identical_ratio"] != 1.0 or rep["pipeline_total"] != 204 or rep["deadlock_witness_code"] != "HYB-E6021") else 0
+    return 1 if args.check and (rep["replay_identical_ratio"] != 1.0 or rep["pipeline_total"] != 204 or rep["deadlock_witness_code"] != "HYB-E6021" or not rep["jitter_is_live"]) else 0
 
 if __name__ == "__main__": sys.exit(main())
