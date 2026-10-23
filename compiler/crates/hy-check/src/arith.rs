@@ -19,6 +19,7 @@ impl<'a> Checker<'a> {
     /// Nested block bodies are NOT recursed here — `walk::flatten` already
     /// lists those statements, and a second walk would duplicate diagnostics.
     pub(crate) fn check_file_const_zero_divisors(&mut self) {
+        self.check_prelude_reserved();
         for d in &self.file.decls {
             if let hy_syntax::Decl::Const(c) = d {
                 self.check_expr_const_zero_divisor(&crate::model::FnState::default(), &c.value);
@@ -299,6 +300,117 @@ impl<'a> Checker<'a> {
                 "fix: use a non-zero constant, or bind the divisor to a variable if a run-time panic is the intended behaviour".to_string(),
             ]),
         );
+    }
+
+    fn check_prelude_reserved(&mut self) {
+        use hy_syntax::Decl;
+        let (mut u, mut decls) = ([false; 3], Vec::new());
+        for d in &self.file.decls {
+            match d {
+                Decl::Const(c) => { c.ty.iter().for_each(|t| scan_ty(t, &mut u)); scan_expr(&c.value, &mut u); decls.push((c.name.as_str(), c.span)); }
+                Decl::Struct(s) => { s.fields.iter().for_each(|f| scan_ty(&f.ty, &mut u)); decls.push((s.name.as_str(), s.span)); }
+                Decl::Fn(f) => {
+                    f.receiver.iter().for_each(|r| scan_ty(&r.ty, &mut u));
+                    f.params.iter().for_each(|p| scan_ty(&p.ty, &mut u));
+                    f.results.iter().for_each(|r| scan_ty(&r.ty, &mut u));
+                    f.body.iter().for_each(|b| scan_block(b, &mut u));
+                    if f.receiver.is_none() && !f.name.contains('.') {
+                        u[0] |= f.name == "some";
+                        u[2] |= f.name == "hy_pop";
+                        decls.push((f.name.as_str(), f.span));
+                    }
+                }
+                Decl::Enum(e) => { e.variants.iter().filter_map(|v| v.payload.as_ref()).for_each(|t| scan_ty(t, &mut u)); decls.push((e.name.as_str(), e.span)); }
+                Decl::TypeAlias(t) => { scan_ty(&t.ty, &mut u); decls.push((t.name.as_str(), t.span)); }
+                Decl::Import { .. } => {}
+            }
+        }
+        for (name, span) in decls {
+            if matches!((name, u), ("option" | "some", [true, ..]) | ("set", [_, true, _]) | ("hy_pop", [.., true])) {
+                let msg = format!("`{name}` is reserved by the Hybrid prelude — the emitted Go would redeclare it (`{name} redeclared in this block`) (HYB-E1002)");
+                self.diags.push(Diagnostic::error("HYB-E1002", self.path.clone(), span, msg).with_notes(vec![
+                    format!("why: when a program triggers the option/set/slice surface, the emitter injects `option`, `some`, `set` and `hy_pop` into the generated Go; a package-level `{name}` lands in the same Go package block and collides (issue #777)"),
+                    "fix: rename the declaration — prelude names are reserved stdlib surface".to_string(),
+                ]));
+                continue;
+            }
+            let w = match name {
+                "panic" if u[0] => "option",
+                "make" | "delete" if u[1] => "set",
+                "len" if u[1] && u[2] => "set/slice",
+                "len" if u[1] => "set",
+                "len" if u[2] => "slice",
+                _ => continue,
+            };
+            let eff = if name == "panic" {
+                "the prelude's `panic(\"HY-PANIC/unwrap-none\")` call reaches the user declaration, so `unwrap()` on `none` silently returns the zero value instead of aborting (issue #1035)"
+            } else {
+                "the prelude's call reaches the user declaration, so the generated Go fails to build (issue #1035)"
+            };
+            let msg = format!("`{name}` is a Go builtin called by the emitted {w} prelude — a package-level declaration shadows it inside the generated prelude (HYB-E1002)");
+            self.diags.push(Diagnostic::error("HYB-E1002", self.path.clone(), span, msg).with_notes(vec![
+                format!("why: this program triggers the {w} surface, so the emitter injects a prelude whose body calls the Go builtin `{name}`. Go resolves package-level declarations before predeclared identifiers, and a builtin cannot be package-qualified, so {eff}"),
+                format!("fix: rename the package-level `{name}` — the prelude cannot recover the builtin once it is shadowed"),
+            ]));
+        }
+    }
+}
+
+fn scan_ty(ty: &hy_syntax::TypeExpr, u: &mut [bool; 3]) {
+    if let hy_syntax::TypeExpr::Fn { params, results, .. } = ty {
+        params.iter().for_each(|p| scan_ty(&p.ty, u));
+        results.iter().for_each(|r| scan_ty(r, u));
+    }
+    let s = ty.render();
+    u[0] |= s.contains("option[");
+    u[1] |= s.contains("set[");
+}
+
+fn scan_block(b: &hy_syntax::Block, u: &mut [bool; 3]) {
+    for (s, _) in crate::walk::flatten(b).stmts {
+        match s {
+            Stmt::Local(l) => { l.ty.iter().for_each(|t| scan_ty(t, u)); l.values.iter().for_each(|v| scan_expr(v, u)); }
+            Stmt::Assign { targets, values, .. } => {
+                targets.iter().for_each(|t| if let PlaceKind::Index { index, .. } = &t.kind { scan_expr(index, u); });
+                values.iter().for_each(|v| scan_expr(v, u));
+            }
+            Stmt::Expr { expr: e, .. } | Stmt::Defer { call: e, .. } | Stmt::If { cond: e, .. }
+            | Stmt::For { kind: ForKind::While { cond: e } | ForKind::Iterate { expr: e, .. }, .. } => scan_expr(e, u),
+            Stmt::Send { chan: a, value: b, .. } | Stmt::For { kind: ForKind::Range { lo: a, hi: b, .. }, .. } => { scan_expr(a, u); scan_expr(b, u); }
+            Stmt::Return { values, .. } => values.iter().for_each(|v| scan_expr(v, u)),
+            Stmt::Task { callee, args, .. } => { scan_expr(callee, u); args.iter().for_each(|a| scan_expr(&a.value, u)); }
+            Stmt::Match { subject, arms, .. } => { scan_expr(subject, u); arms.iter().filter_map(|a| a.guard.as_ref()).for_each(|g| scan_expr(g, u)); }
+            Stmt::Select { arms, .. } => for a in arms {
+                if let SelectArmKind::Send { chan, value, .. } = &a.kind { scan_expr(chan, u); scan_expr(value, u); }
+                else if let SelectArmKind::Recv { chan, .. } = &a.kind { scan_expr(chan, u); }
+            },
+            _ => {}
+        }
+    }
+}
+
+fn scan_expr(e: &Expr, u: &mut [bool; 3]) {
+    match e {
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident { name, .. } | Expr::Field { name, .. } = unwrap_parens(callee) {
+                u[0] |= name == "some";
+                u[1] |= matches!(name.as_str(), "insert" | "contains" | "remove");
+                u[2] |= matches!(name.as_str(), "hy_pop" | "pop");
+            }
+            scan_expr(callee, u);
+            args.iter().for_each(|a| scan_expr(&a.value, u));
+        }
+        Expr::StructLit { ty, fields, .. } => { ty.iter().for_each(|t| scan_ty(t, u)); fields.iter().for_each(|f| scan_expr(&f.value, u)); }
+        Expr::SliceLit { elem, items, .. } => { elem.iter().for_each(|t| scan_ty(t, u)); items.iter().for_each(|i| scan_expr(i, u)); }
+        Expr::MapLit { key, value, entries, .. } => { scan_ty(key, u); scan_ty(value, u); entries.iter().for_each(|(k, v)| { scan_expr(k, u); scan_expr(v, u); }); }
+        Expr::FnLit { params, results, body, .. } => { params.iter().for_each(|p| scan_ty(&p.ty, u)); results.iter().for_each(|r| scan_ty(&r.ty, u)); scan_block(body, u); }
+        Expr::Interp { parts, .. } => parts.iter().for_each(|p| if let InterpPart::Expr(x) = p { scan_expr(x, u); }),
+        Expr::Binary { lhs: a, rhs: b, .. } | Expr::Index { base: a, index: b, .. } => { scan_expr(a, u); scan_expr(b, u); }
+        Expr::Slice { base, lo, hi, .. } => [Some(base.as_ref()), lo.as_deref(), hi.as_deref()].into_iter().flatten().for_each(|x| scan_expr(x, u)),
+        Expr::Unary { operand: x, .. } | Expr::AddrOf { operand: x, .. } | Expr::Move { operand: x, .. }
+        | Expr::Try { operand: x, .. } | Expr::Receive { chan: x, .. } | Expr::Field { base: x, .. }
+        | Expr::Paren { inner: x, .. } => scan_expr(x, u),
+        Expr::Ident { .. } | Expr::Lit { .. } => {}
     }
 }
 
