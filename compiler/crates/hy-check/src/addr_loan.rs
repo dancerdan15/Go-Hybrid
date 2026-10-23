@@ -185,7 +185,10 @@ impl<'a> Checker<'a> {
                 self.check_expr_addr_of_loan_projections(st, chan, include_direct_ident);
                 self.check_expr_addr_of_loan_projections(st, value, include_direct_ident);
             }
-            Stmt::If { cond, .. } => {
+            Stmt::If { init, cond, .. } => {
+                if let Some(init) = init {
+                    self.check_stmt_addr_of_loan_projections(st, init, include_direct_ident);
+                }
                 self.check_expr_addr_of_loan_projections(st, cond, include_direct_ident);
             }
             Stmt::For { kind, .. } => match kind {
@@ -334,7 +337,7 @@ impl<'a> Checker<'a> {
                         self.emit_addr_of_loan_diag(name, *id_span);
                     }
                 }
-                Expr::Field { .. } => {
+                Expr::Field { .. } | Expr::Index { .. } => {
                     if let Some(root) = operand.root_ident() {
                         if self.lookup_binding(st, root).is_some_and(|b| b.slot_loan) {
                             self.emit_addr_of_loan_diag(root, *span);
@@ -418,6 +421,13 @@ impl<'a> Checker<'a> {
     }
 
     fn emit_addr_of_loan_diag(&mut self, name: &str, span: Span) {
+        if self
+            .diags
+            .iter()
+            .any(|d| d.severity == hy_diag::Severity::Error && d.span == span)
+        {
+            return;
+        }
         let msg = format!(
             "`&{}` takes the address of a loan: a map-slot loan is not an addressable value (T24)",
             name
