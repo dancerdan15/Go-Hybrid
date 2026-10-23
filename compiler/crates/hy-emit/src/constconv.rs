@@ -35,13 +35,48 @@ pub fn width_of(spec_name: &str) -> Option<(u32, bool)> {
         "u8" | "byte" | "uint8" => (8, false),
         "u16" | "uint16" => (16, false),
         "u32" | "uint32" => (32, false),
-        "u64" | "uint64" => (64, false),
+        "u64" | "uint64" | "uint" | "uintptr" => (64, false),
         "i8" | "int8" => (8, true),
         "i16" | "int16" => (16, true),
         "i32" | "int32" | "rune" => (32, true),
-        "i64" | "int64" => (64, true),
+        "i64" | "int64" | "int" => (64, true),
         _ => return None,
     })
+}
+
+fn truncate_to_width(v: i128, bits: u32, signed: bool) -> i128 {
+    if bits >= 128 {
+        return v;
+    }
+    let len = 1i128 << bits;
+    let masked = v & (len - 1);
+    if signed && (masked >> (bits - 1)) & 1 == 1 {
+        masked - len
+    } else {
+        masked
+    }
+}
+
+fn call_conv_target(expr: &hy_syntax::Expr) -> Option<((u32, bool), &hy_syntax::Expr)> {
+    use hy_syntax::Expr;
+    let Expr::Call { callee, args, .. } = expr else {
+        return None;
+    };
+    if args.len() != 1 || args[0].spread || args[0].name.is_some() {
+        return None;
+    }
+    let mut bare = callee.as_ref();
+    while let Expr::Paren { inner, .. } = bare {
+        bare = inner;
+    }
+    let Expr::Ident { name, .. } = bare else {
+        return None;
+    };
+    let (bits, signed) = width_of(name)?;
+    if bits > 64 {
+        return None;
+    }
+    Some(((bits, signed), &args[0].value))
 }
 
 /// Integer literal text -> value. Accepts the SPEC-LANGUAGE §LX6 forms:
@@ -84,6 +119,11 @@ fn const_int_expr(expr: &hy_syntax::Expr) -> Option<i128> {
             kind: LitKind::Char(c),
             ..
         } => Some(*c as u32 as i128),
+        Expr::Call { .. } => {
+            let ((bits, signed), arg) = call_conv_target(expr)?;
+            let inner_v = const_int_expr(arg)?;
+            Some(truncate_to_width(inner_v, bits, signed))
+        }
         Expr::Binary { op, lhs, rhs, .. } => {
             let l = const_int_expr(lhs)?;
             let r = const_int_expr(rhs)?;
@@ -131,28 +171,45 @@ fn const_int_expr(expr: &hy_syntax::Expr) -> Option<i128> {
     }
 }
 
+fn contains_conversion_call(expr: &hy_syntax::Expr) -> bool {
+    use hy_syntax::Expr;
+    match expr {
+        Expr::Paren { inner, .. } | Expr::Unary { operand: inner, .. } => {
+            contains_conversion_call(inner)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            contains_conversion_call(lhs) || contains_conversion_call(rhs)
+        }
+        Expr::Call { .. } => call_conv_target(expr).is_some(),
+        _ => false,
+    }
+}
+
 fn has_out_of_range_subexpr(expr: &hy_syntax::Expr, bits: u32, signed: bool) -> bool {
     use hy_syntax::Expr;
     let Some(v) = const_int_expr(expr) else {
         return false;
     };
-    let len = 1i128 << bits;
-    let masked = v & (len - 1);
-    let folded = if signed && (masked >> (bits - 1)) & 1 == 1 {
-        masked - len
-    } else {
-        masked
-    };
-    if v != folded {
+    if v != truncate_to_width(v, bits, signed) {
         return true;
     }
     match expr {
-        Expr::Paren { inner, .. } | Expr::Unary { operand: inner, .. } => {
-            has_out_of_range_subexpr(inner, bits, signed)
+        Expr::Paren { inner, .. } => has_out_of_range_subexpr(inner, bits, signed),
+        Expr::Unary { operand: inner, .. } => {
+            contains_conversion_call(inner) || has_out_of_range_subexpr(inner, bits, signed)
         }
         Expr::Binary { lhs, rhs, .. } => {
-            has_out_of_range_subexpr(lhs, bits, signed)
+            contains_conversion_call(lhs)
+                || contains_conversion_call(rhs)
+                || has_out_of_range_subexpr(lhs, bits, signed)
                 || has_out_of_range_subexpr(rhs, bits, signed)
+        }
+        Expr::Call { .. } => {
+            let Some(((inner_bits, inner_signed), arg)) = call_conv_target(expr) else {
+                return false;
+            };
+            has_out_of_range_subexpr(arg, inner_bits, inner_signed)
+                || has_out_of_range_subexpr(arg, bits, signed)
         }
         _ => false,
     }
@@ -168,14 +225,7 @@ pub fn fold_constant(operand: &hy_syntax::Expr, spec_name: &str) -> Option<i128>
         return None;
     }
     let v = const_int_expr(operand)?;
-
-    let len = 1i128 << bits;
-    let masked = v & (len - 1);
-    let folded = if signed && (masked >> (bits - 1)) & 1 == 1 {
-        masked - len
-    } else {
-        masked
-    };
+    let folded = truncate_to_width(v, bits, signed);
 
     // Only rewrite what Go would refuse; a fitting value whose sub-operands
     // also fit in the target width stays verbatim.
