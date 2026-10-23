@@ -1,0 +1,5 @@
+{
+  "usage_stderr": "usage: tools/env.sh [--check]",
+  "rejected_args": [["--unknown"], ["--help"], ["check"], ["--check", "extra"]],
+  "summary_prefixes": ["Go:", "Rust:", "Cargo:", "Kaggle:", "Cores:"]
+}

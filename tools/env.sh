@@ -29,14 +29,35 @@ export HEAVY_LOCK="/tmp/heavy.lock"
 
 # Verify pins quickly: `source tools/env.sh && tools/env.sh --check`
 check() {
-  go version 2>/dev/null | rg -q "$PINNED_GO" || echo "WARN: go != $PINNED_GO"
-  rustc --version 2>/dev/null | rg -q "$PINNED_RUST" || echo "WARN: rustc != $PINNED_RUST"
-  df -h / | tail -1
-  free -m | head -2
+  local rc=0 go_out="" go_ver="" rust_out="" rust_ver=""
+  if command -v go >/dev/null 2>&1 && go_out="$(go version 2>/dev/null)"; then
+    go_ver="$(printf '%s\n' "$go_out" | awk '$1 == "go" && $2 == "version" {print $3; exit}')"
+  fi
+  if [[ "$go_ver" != "$PINNED_GO" ]]; then
+    echo "WARN: go != $PINNED_GO (got: ${go_ver:-missing})"
+    rc=1
+  fi
+  if command -v rustc >/dev/null 2>&1 && rust_out="$(rustc --version 2>/dev/null)"; then
+    rust_ver="$(printf '%s\n' "$rust_out" | awk '$1 == "rustc" {print $2; exit}')"
+  fi
+  if [[ "$rust_ver" != "$PINNED_RUST" ]]; then
+    echo "WARN: rustc != $PINNED_RUST (got: ${rust_ver:-missing})"
+    rc=1
+  fi
+  df -h / | tail -1 || true
+  free -m 2>/dev/null | head -2 || true
+  return "$rc"
 }
 
 # ==== inline check when invoked directly ====
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [[ $# -eq 1 && "$1" == "--check" ]]; then
+    check
+    exit $?
+  elif [[ $# -gt 0 ]]; then
+    echo "usage: tools/env.sh [--check]" >&2
+    exit 2
+  fi
   echo "Go:      $(go version 2>/dev/null || echo MISSING)"
   echo "Rust:    $(rustc --version 2>/dev/null || echo MISSING)"
   echo "Cargo:   $(cargo --version 2>/dev/null || echo MISSING)"

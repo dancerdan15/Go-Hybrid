@@ -1,0 +1,12 @@
+{
+  "pinned_go": "go1.26.9",
+  "pinned_rust": "1.99.0",
+  "cases": [
+    {"name": "exact_match", "go_out": "go version go1.26.9 linux/amd64", "go_rc": 0, "rust_out": "rustc 1.99.0 (stable 2026-09-28)", "rust_rc": 0, "expected_rc": 0, "warns": []},
+    {"name": "go_suffix_drift", "go_out": "go version go1.26.90 linux/amd64", "go_rc": 0, "rust_out": "rustc 1.99.0 (stable)", "rust_rc": 0, "expected_rc": 1, "warns": ["WARN: go != go1.26.9 (got: go1.26.90)"]},
+    {"name": "rust_suffix_drift", "go_out": "go version go1.26.9 linux/amd64", "go_rc": 0, "rust_out": "rustc 1.99.0-nightly (abcdef 2026-10-01)", "rust_rc": 0, "expected_rc": 1, "warns": ["WARN: rustc != 1.99.0 (got: 1.99.0-nightly)"]},
+    {"name": "regex_dot_wildcard_drift", "go_out": "go version go1X26X9 linux/amd64", "go_rc": 0, "rust_out": "rustc 1X99X0 (stable)", "rust_rc": 0, "expected_rc": 1, "warns": ["WARN: go != go1.26.9 (got: go1X26X9)", "WARN: rustc != 1.99.0 (got: 1X99X0)"]},
+    {"name": "nonzero_probe_exit", "go_out": "go version go1.26.9 linux/amd64", "go_rc": 7, "rust_out": "rustc 1.99.0 (stable)", "rust_rc": 9, "expected_rc": 1, "warns": ["WARN: go != go1.26.9 (got: missing)", "WARN: rustc != 1.99.0 (got: missing)"]},
+    {"name": "missing_binaries", "go_out": null, "go_rc": 0, "rust_out": null, "rust_rc": 0, "expected_rc": 1, "warns": ["WARN: go != go1.26.9 (got: missing)", "WARN: rustc != 1.99.0 (got: missing)"]}
+  ]
+}

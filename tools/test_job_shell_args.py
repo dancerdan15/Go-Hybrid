@@ -4,6 +4,8 @@ import io
 import json
 from pathlib import Path
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,7 @@ job_tool = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(job_tool)
 
 
+@unittest.skipUnless(Path("/bin/sh").exists(), "requires /bin/sh")
 class KaggleShellArgumentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hybrid-cli-args-")
@@ -124,6 +127,142 @@ class KaggleShellArgumentTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             job_tool.kaggle_status()
         self.assertEqual(self.calls(), [["kernels", "status", "owner/kernel"]])
+
+
+def _find_bash_and_awk():
+    for candidate in ("/bin/bash", "C:/Program Files/Git/bin/bash.exe", shutil.which("bash")):
+        if not candidate or not Path(candidate).exists():
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "command -v awk"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                return candidate, probe.stdout.strip().splitlines()[0]
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None, None
+
+
+def _bash_path(path: Path) -> str:
+    posix = path.resolve().as_posix()
+    return f"/{posix[0].lower()}{posix[2:]}" if len(posix) > 2 and posix[1] == ":" else posix
+
+
+BASH_BIN, AWK_BIN = _find_bash_and_awk()
+CHECK_MATRIX_FIXTURE = ROOT / "tools/tests/issue_1127_env_check_matrix.json"
+CLI_ARGS_FIXTURE = ROOT / "tools/tests/issue_1127_env_cli_args.json"
+
+
+@unittest.skipUnless(BASH_BIN and AWK_BIN, "requires bash and awk")
+class EnvShPinAndCliTests(unittest.TestCase):
+    def setUp(self):
+        self.matrix = json.loads(CHECK_MATRIX_FIXTURE.read_text(encoding="utf-8"))
+        self.cli_spec = json.loads(CLI_ARGS_FIXTURE.read_text(encoding="utf-8"))
+        self.tmp = tempfile.TemporaryDirectory(prefix="hybrid-env-sh-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home_z = self.root / "home-z"
+        self.go_bin = self.home_z / "tools/go/bin"
+        self.go_bin.mkdir(parents=True)
+        self.sys_bin = self.root / "sys-bin"
+        self.sys_bin.mkdir()
+        self._write_exec(self.sys_bin / "awk", f'exec "{AWK_BIN}" "$@"')
+        for cmd, body in (
+            ("df", "printf 'Filesystem Size Used Avail Use%% Mounted\\nfs 10G 5G 5G 50%% /\\n'"),
+            ("tail", 'last=""; while IFS= read -r l; do last="$l"; done; printf "%s\\n" "$last"'),
+            ("free", "printf 'total used free\\nMem: 4000 1000 3000\\n'"),
+            ("head", 'IFS= read -r l1 || :; IFS= read -r l2 || :; printf "%s\\n%s\\n" "$l1" "$l2"'),
+            ("nproc", "printf '2\\n'"),
+        ):
+            self._write_exec(self.sys_bin / cmd, body)
+        self.env_sh = self.root / "env.sh"
+        raw = (ROOT / "tools/env.sh").read_text(encoding="utf-8")
+        isolated = raw.replace("/home/z", _bash_path(self.home_z)).replace(
+            ":$PATH", ":" + _bash_path(self.sys_bin)
+        )
+        self.env_sh.write_text(isolated, encoding="utf-8", newline="\n")
+
+    @staticmethod
+    def _write_exec(path: Path, body: str):
+        path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8", newline="\n")
+        path.chmod(0o755)
+
+    def _configure_toolchains(self, go_out, go_rc, rust_out, rust_rc):
+        for name, out, rc in (("go", go_out, go_rc), ("rustc", rust_out, rust_rc)):
+            target = self.go_bin / name
+            if out is None:
+                target.unlink(missing_ok=True)
+            else:
+                self._write_exec(target, f"printf '%s\\n' {shlex.quote(out)}\nexit {int(rc)}")
+
+    def test_env_sh_lf_and_static_contract(self):
+        raw_bytes = (ROOT / "tools/env.sh").read_bytes()
+        self.assertNotIn(b"\r\n", raw_bytes)
+        text = raw_bytes.decode("utf-8")
+        self.assertNotIn("rg -q", text)
+        self.assertIn(f'PINNED_GO="{self.matrix["pinned_go"]}"', text)
+        self.assertIn(f'PINNED_RUST="{self.matrix["pinned_rust"]}"', text)
+        syntax = subprocess.run(
+            [BASH_BIN, "-n", _bash_path(ROOT / "tools/env.sh")],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_direct_check_matrix_without_rg(self):
+        for case in self.matrix["cases"]:
+            with self.subTest(case=case["name"]):
+                self._configure_toolchains(
+                    case["go_out"], case["go_rc"], case["rust_out"], case["rust_rc"]
+                )
+                res = subprocess.run(
+                    [BASH_BIN, _bash_path(self.env_sh), "--check"],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                self.assertEqual(res.returncode, case["expected_rc"], res.stdout + res.stderr)
+                if case["expected_rc"] == 0:
+                    self.assertNotIn("WARN:", res.stdout)
+                for warn in case["warns"]:
+                    self.assertIn(warn, res.stdout)
+
+    def test_sourced_check_returns_nonzero_on_mismatch_and_zero_on_match(self):
+        self._configure_toolchains("go version go1.26.90 linux/amd64", 0, "rustc 1.99.0 (stable)", 0)
+        bad = subprocess.run(
+            [BASH_BIN, "-c", f'source "{_bash_path(self.env_sh)}" && check'],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("WARN: go != go1.26.9 (got: go1.26.90)", bad.stdout)
+
+        self._configure_toolchains("go version go1.26.9 linux/amd64", 0, "rustc 1.99.0 (stable)", 0)
+        ok = subprocess.run(
+            [BASH_BIN, "-c", f'source "{_bash_path(self.env_sh)}" && check'],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertNotIn("WARN:", ok.stdout)
+
+    def test_unknown_or_extra_cli_args_rejected_with_usage_on_stderr(self):
+        for argv in self.cli_spec["rejected_args"]:
+            with self.subTest(argv=argv):
+                res = subprocess.run(
+                    [BASH_BIN, _bash_path(self.env_sh), *argv],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                self.assertEqual(res.returncode, 2)
+                self.assertIn(self.cli_spec["usage_stderr"], res.stderr)
+                self.assertNotIn("Go:", res.stdout)
+
+    def test_no_arg_direct_invocation_prints_summary_and_exits_zero(self):
+        self._configure_toolchains("go version go1.26.9 linux/amd64", 0, "rustc 1.99.0 (stable)", 0)
+        res = subprocess.run(
+            [BASH_BIN, _bash_path(self.env_sh)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for prefix in self.cli_spec["summary_prefixes"]:
+            self.assertIn(prefix, res.stdout)
 
 
 if __name__ == "__main__":
