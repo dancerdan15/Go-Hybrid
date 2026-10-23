@@ -1,0 +1,13 @@
+{
+  "upstream_repo": "https://github.com/limitlessprojects/Go-Hybrid.git",
+  "custom_repo": "https://example.invalid/custom/Go-Hybrid.git",
+  "pinned_sha": "0123456789abcdef0123456789abcdef01234567",
+  "codeload_prefix": "https://codeload.github.com/limitlessprojects/Go-Hybrid/tar.gz/",
+  "scenarios": [
+    {"name": "clone_and_checkout_ok", "clone_rc": 0, "checkout_rc": 0, "expect_codeload": false, "expect_exit": 0},
+    {"name": "clone_fails_triggers_codeload", "clone_rc": 128, "checkout_rc": 0, "curl_rc": 0, "tar_rc": 0, "expect_codeload": true, "expect_exit": 0},
+    {"name": "checkout_fails_triggers_codeload", "clone_rc": 0, "checkout_rc": 1, "curl_rc": 0, "tar_rc": 0, "expect_codeload": true, "expect_exit": 0},
+    {"name": "curl_fails_aborts_before_tar", "clone_rc": 128, "curl_rc": 22, "tar_rc": 0, "expect_codeload": true, "expect_tar": false, "expect_exit": 22},
+    {"name": "tar_fails_aborts_before_runner", "clone_rc": 128, "curl_rc": 0, "tar_rc": 2, "expect_codeload": true, "expect_tar": true, "expect_exit": 2}
+  ]
+}

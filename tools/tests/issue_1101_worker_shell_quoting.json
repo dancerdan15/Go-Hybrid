@@ -1,0 +1,9 @@
+{
+  "work_dir_suffix": "work owner's dir;echo PWNED",
+  "dangerous_repo": "https://github.com/limitlessprojects/Go-Hybrid.git;echo INJECTED",
+  "dangerous_sha": "main;touch pwned",
+  "option_like_sha": "--help",
+  "forbidden_pipe_substrings": ["| tail -2", "| tar "],
+  "required_git_clone_tokens": ["git", "clone", "--quiet", "--"],
+  "required_git_checkout_tokens": ["git", "checkout", "--quiet", "--detach", "--end-of-options"]
+}
