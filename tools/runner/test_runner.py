@@ -386,8 +386,8 @@ class RunnerRedactAndContractTests(unittest.TestCase):
 
         self.assertEqual(runner.redact(None), {})
 
-    def test_non_dict_steps_respect_fail_soft_contract(self):
-        for case_name in ('non_dict_command_fail_soft', 'non_dict_setup_fail_soft'):
+    def test_non_dict_steps_follow_step_contract(self):
+        for case_name in ('non_dict_command_fail_soft', 'non_dict_setup_hard_fail'):
             case = self.contract_cases[case_name]
             with self.subTest(case=case_name):
                 code, summary = RunnerFailureTests().run_job(

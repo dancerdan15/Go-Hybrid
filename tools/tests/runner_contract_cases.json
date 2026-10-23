@@ -14,20 +14,18 @@
       ["survivor", 0]
     ]
   },
-  "non_dict_setup_fail_soft": {
+  "non_dict_setup_hard_fail": {
     "setup": [
       "bad-setup-entry",
       {"name": "good-setup", "code": "print('setup-ok')", "hard": false, "timeout": 10}
     ],
     "commands": [
-      {"name": "cmd-after-soft-setup", "code": "print('cmd-ok')", "hard": false, "timeout": 10}
+      {"name": "cmd-after-bad-setup", "code": "print('cmd-ok')", "hard": false, "timeout": 10}
     ],
     "expected_code": 1,
     "expected_ok": false,
     "expected_steps": [
-      ["setup-0", 1],
-      ["good-setup", 0],
-      ["cmd-after-soft-setup", 0]
+      ["setup-0", 1]
     ]
   },
   "invalid_timeouts": [

@@ -14,6 +14,7 @@
     "GITHUB_PAT": "secret-gh-pat",
     "MY_PAT_VALUE": "nested-pat-val",
     "GH-PAT": "hyphen-pat-val",
+    "GITHUBPAT": "joined-pat-val",
     "KAGGLE_DATA_PROXY_TOKEN": "session-jwt",
     "KAGGLE_USER_SECRETS_TOKEN": "user-secret-jwt",
     "GITHUB_API_KEY": "api-key-val",

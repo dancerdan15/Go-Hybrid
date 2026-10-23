@@ -126,7 +126,7 @@ def _is_secret_key(k: str) -> bool:
     segments = ku.replace("-", "_").split("_")
     for s in _SECRET_KEY:
         if s == "PAT":
-            if "PAT" in segments:
+            if "PAT" in segments or ku.endswith("PAT"):
                 return True
         elif s in ku:
             return True
@@ -280,7 +280,8 @@ def main():
         for idx, step in enumerate(setup_raw):
             if not isinstance(step, dict):
                 record("setup-{}".format(idx), "setup", 1, 0.0, "step must be an object, got {}".format(type(step).__name__))
-                continue
+                hard_setup_failed = True
+                break
             raw_name = step.get("name")
             name = raw_name if isinstance(raw_name, str) and raw_name.strip() else "setup-{}".format(idx)
             cmd = step.get("run")
