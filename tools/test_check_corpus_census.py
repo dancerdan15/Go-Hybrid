@@ -8,10 +8,13 @@ so the drift and the clean case are both pinned.
 STATUS.md is deliberately outside the surface list (supervisor-only file in
 this pipeline), so no drift test exists for it.
 """
+import contextlib
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("check_corpus_census.py")
 SPEC = importlib.util.spec_from_file_location("corpus_census", SCRIPT)
@@ -179,6 +182,70 @@ class FailClosedTests(_ProblemsMixin, unittest.TestCase):
         hits = self._problems_with("Makefile", "# the corpus line moved away\n")
         self.assertEqual(len(hits), 1)
         self.assertIn("no corpus count found", hits[0])
+
+
+class RatioDenominatorTests(_ProblemsMixin, unittest.TestCase):
+    def test_ci_denominator_only_drift_is_named(self):
+        hits = self._problems_with(
+            ".github/workflows/ci.yml",
+            "      - name: x (verdict agreement (3/2 + tripwire)\n",
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("says 3/2, corpus holds 3", hits[0])
+
+    def test_makefile_denominator_only_drift_is_named(self):
+        hits = self._problems_with(
+            "Makefile",
+            '\t@echo "make corpus           — Tier-0 corpus verdicts (3/2)"\n',
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("says 3/2, corpus holds 3", hits[0])
+
+    def test_readme_denominator_only_drift_is_named(self):
+        hits = self._problems_with(
+            "README.md",
+            "| x | y | z [checker corpus 3/2](p) |\n",
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("says 3/2, corpus holds 3", hits[0])
+
+    def test_later_stale_ratio_is_not_hidden_by_a_consistent_one(self):
+        hits = self._problems_with(
+            "README.md",
+            "| a | b | c [checker corpus 3/3](p) |\n| d | e | f [checker corpus 3/2](p) |\n",
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("says 3/2, corpus holds 3", hits[0])
+
+    def test_cli_distinguishes_clean_and_denominator_only_drift(self):
+        clean_tmp, clean_root = make_tree(consistent_tree())
+        self.addCleanup(clean_tmp.cleanup)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(MOD, "REPO_ROOT", clean_root), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(err):
+            rc = MOD.main()
+        self.assertEqual(rc, 0)
+        self.assertIn("OK: all 7 corpus census surfaces agree", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+        drifted = consistent_tree()
+        drifted[".github/workflows/ci.yml"] = (
+            "      - name: x (verdict agreement (3/2 + tripwire)\n"
+        )
+        drifted["Makefile"] = '\t@echo "make corpus           — Tier-0 corpus verdicts (3/2)"\n'
+        drifted["README.md"] = "| x | y | z [checker corpus 3/2](p) |\n"
+        drift_tmp, drift_root = make_tree(drifted)
+        self.addCleanup(drift_tmp.cleanup)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(MOD, "REPO_ROOT", drift_root), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(err):
+            rc = MOD.main()
+        self.assertEqual(rc, 1)
+        self.assertIn(".github/workflows/ci.yml: says 3/2, corpus holds 3", err.getvalue())
+        self.assertIn("Makefile: says 3/2, corpus holds 3", err.getvalue())
+        self.assertIn("README.md: says 3/2, corpus holds 3", err.getvalue())
 
 
 if __name__ == "__main__":
