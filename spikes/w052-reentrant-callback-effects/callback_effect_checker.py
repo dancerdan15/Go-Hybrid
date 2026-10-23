@@ -53,7 +53,8 @@ CURATED_CALLBACK_CONTRACTS: dict[str, CallbackContract] = {
     "http.handle_func": CallbackContract("http.handle_func", Modality.CONCURRENT_MULTI),
     "http.listen_and_serve": CallbackContract("http.listen_and_serve", Modality.CONCURRENT_MULTI),
     "time.after_func": CallbackContract("time.after_func", Modality.CONCURRENT_MULTI),
-    "mux.handle": CallbackContract("mux.handle", Modality.CONCURRENT_MULTI),
+    "http.serve_mux.handle": CallbackContract("http.serve_mux.handle", Modality.CONCURRENT_MULTI),
+    "http.serve_mux.handle_func": CallbackContract("http.serve_mux.handle_func", Modality.CONCURRENT_MULTI),
     "http.handler": CallbackContract("http.handler", Modality.CONCURRENT_MULTI),
 }
 
@@ -64,7 +65,8 @@ _DECL_RE = re.compile(r"^\s*(?:(let|const|var)\s+([A-Za-z_]\w*)(?:\s+([^=]+?))?(
 _CALL_FN_RE = re.compile(
     r"^(?:managed\s*\([^)]*\)\s*\{\s*)?(?P<callee>[A-Za-z_]\w*\.[A-Za-z_]\w*)\((?P<prefix>.*?)\bfn\s*\((?P<params>[^)]*)\)[^{]*\{(?P<body>.*)\}(?P<suffix>[^)]*)\)"
 )
-_CALL_VAR_RE = re.compile(r"^(?:managed\s*\([^)]*\)\s*\{\s*)?(?P<callee>[A-Za-z_]\w*\.[A-Za-z_]\w*)\((?P<args>[^)]*)\)")
+_LHS_RE = re.compile(r"^(?:return\s+|[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*(?::=|=(?!=))\s*)")
+_CALL_VAR_RE =re.compile(r"^(?:managed\s*\([^)]*\)\s*\{\s*)?(?P<callee>[A-Za-z_]\w*\.[A-Za-z_]\w*)\((?P<args>[^)]*)\)")
 
 
 def _infer_type(rhs: str, explicit_ty: str | None, env: dict[str, Binding]) -> tuple[str, str]:
@@ -73,6 +75,8 @@ def _infer_type(rhs: str, explicit_ty: str | None, env: dict[str, Binding]) -> t
         return (f"*{env[base].ty}" if rhs.startswith("&") else (explicit_ty or env[base].ty)), env[base].root
     if explicit_ty:
         return explicit_ty, ""
+    if re.match(r"^http\.new_serve_mux\s*\(\s*\)$", rhs):
+        return "http.serve_mux", ""  # receiver type keys the mux contract; ServeMux is concurrency-safe (no `*`, not is_mutable_gc)
     for pfx, inferred in ((("make(chan ", "make(chan<-"), "chan"), (("map[", "make(map["), "map[any]any"), (("[]", "make([]"), "[]any"), (("&",), "*any")):
         if rhs.startswith(pfx):
             return inferred, ""
@@ -113,7 +117,50 @@ def _iter_statements(source: str) -> list[str]:
     return stmts
 
 
-def check_program(source: str, contracts: dict[str, CallbackContract] | None = None) -> list[Diagnostic]:
+def _call_info(text: str, closures: dict[str, tuple[set[str], str]]) -> tuple[str, list[str], set[str], str] | None:
+    if m_call := _CALL_FN_RE.search(text):
+        args = [a.strip() for a in f"{m_call.group('prefix')}<fn>{m_call.group('suffix')}".split(",") if a.strip()]
+        params = {p.strip().split()[0] for p in m_call.group("params").split(",") if p.strip()}
+        return m_call.group("callee"), args, params, m_call.group("body")
+    if m_var := _CALL_VAR_RE.search(text):
+        args = [a.strip() for a in m_var.group("args").split(",") if a.strip()]
+        for a in args:
+            if a in closures:
+                return m_var.group("callee"), args, closures[a][0], closures[a][1]
+    return None
+
+
+def _lookup_contract(callee: str, env: dict[str, Binding], registry: dict[str, CallbackContract]) -> CallbackContract | None:
+    recv, _, method = callee.partition(".")
+    return registry.get(f"{env[recv].ty.removeprefix('*')}.{method}") if recv in env else registry.get(callee)
+
+
+def _analyze_call(call_info: tuple[str, list[str], set[str], str], is_managed: bool, env: dict[str, Binding], registry: dict[str, CallbackContract], diags: list[Diagnostic]) -> None:
+    callee, args, params, body = call_info
+    clean = _clean_body(body)
+    contract = _lookup_contract(callee, env, registry)
+    if contract is None:
+        if not is_managed:
+            diags.append(Diagnostic("HYB-E5203", "UnannotatedForeignCallbackEscape", callee, f"unannotated callback `{callee}`"))
+        return
+    if contract.modality is Modality.SYNC_SCOPED:
+        subj_raw = args[contract.subject_arg] if contract.subject_arg is not None and contract.subject_arg < len(args) else ""
+        subj = m.group(1) if (m := _BASE_RE.match(subj_raw)) else subj_raw
+        subj_root = env[subj].root if subj in env else subj
+        for b_name, b in env.items():
+            if b_name not in params and subj_root and b.root == subj_root and _mutates_var(body, b_name) and not is_managed:
+                diags.append(Diagnostic("HYB-E5201", "CallbackReentrantContainerMutation", b_name, f"reentrant mutation of `{b_name}`"))
+    elif contract.modality is Modality.CONCURRENT_MULTI:
+        for b_name, b in env.items():
+            if b_name in params or _is_shadowed(clean, b_name) or not re.search(rf"(?<!\.)\b{re.escape(b_name)}\b", clean):
+                continue
+            if b.is_channel or (b.kind in ("let", "const") and not b.is_mutable_gc):
+                continue
+            if (b.is_mutable_gc or _mutates_var(body, b_name)) and not is_managed:
+                diags.append(Diagnostic("HYB-E5202", "ConcurrentCallbackMutableCapture", b_name, f"concurrent mutable capture `{b_name}`"))
+
+
+def check_program(source: str, contracts: dict[str, CallbackContract] | None = None, stats: dict[str, int] | None = None) -> list[Diagnostic]:
     registry = CURATED_CALLBACK_CONTRACTS if contracts is None else contracts
     env: dict[str, Binding] = {}
     closures: dict[str, tuple[set[str], str]] = {}
@@ -121,52 +168,22 @@ def check_program(source: str, contracts: dict[str, CallbackContract] | None = N
 
     for line in _iter_statements(source):
         is_managed = bool(_MANAGED_RE.match(line))
-        call_info: tuple[str, list[str], set[str], str] | None = None
-        if m_call := _CALL_FN_RE.search(line):
-            args = [a.strip() for a in f"{m_call.group('prefix')}<fn>{m_call.group('suffix')}".split(",") if a.strip()]
-            params = {p.strip().split()[0] for p in m_call.group("params").split(",") if p.strip()}
-            call_info = (m_call.group("callee"), args, params, m_call.group("body"))
-        elif m_var := _CALL_VAR_RE.search(line):
-            args = [a.strip() for a in m_var.group("args").split(",") if a.strip()]
-            for a in args:
-                if a in closures:
-                    call_info = (m_var.group("callee"), args, closures[a][0], closures[a][1])
-                    break
+        m_decl = _DECL_RE.match(line)
+        rhs = ((m_decl.group(4) if m_decl.group(1) else m_decl.group(6)) or "").strip() if m_decl else ""
+        # a declaration's call rhs (or the remainder after `return ` / `a, b := ` / `a = ` / `_ = `) is analysed BEFORE the closure-literal path
+        call_info = _call_info(rhs if m_decl else _LHS_RE.sub("", line, count=1), closures)
         if call_info is not None:
-            callee, args, params, body = call_info
-            clean = _clean_body(body)
-            contract = registry.get(callee)
-            if contract is None:
-                if not is_managed:
-                    diags.append(Diagnostic("HYB-E5203", "UnannotatedForeignCallbackEscape", callee, f"unannotated callback `{callee}`"))
-                continue
-            if contract.modality is Modality.SYNC_SCOPED:
-                subj_raw = args[contract.subject_arg] if contract.subject_arg is not None and contract.subject_arg < len(args) else ""
-                subj = m.group(1) if (m := _BASE_RE.match(subj_raw)) else subj_raw
-                subj_root = env[subj].root if subj in env else subj
-                for b_name, b in env.items():
-                    if b_name not in params and subj_root and b.root == subj_root and _mutates_var(body, b_name) and not is_managed:
-                        diags.append(Diagnostic("HYB-E5201", "CallbackReentrantContainerMutation", b_name, f"reentrant mutation of `{b_name}`"))
-            elif contract.modality is Modality.CONCURRENT_MULTI:
-                for b_name, b in env.items():
-                    if b_name in params or _is_shadowed(clean, b_name) or not re.search(rf"(?<!\.)\b{re.escape(b_name)}\b", clean):
-                        continue
-                    if b.is_channel or (b.kind in ("let", "const") and not b.is_mutable_gc):
-                        continue
-                    if (b.is_mutable_gc or _mutates_var(body, b_name)) and not is_managed:
-                        diags.append(Diagnostic("HYB-E5202", "ConcurrentCallbackMutableCapture", b_name, f"concurrent mutable capture `{b_name}`"))
+            if stats is not None:
+                stats["call_sites"] = stats.get("call_sites", 0) + 1
+            _analyze_call(call_info, is_managed, env, registry, diags)
+        if m_decl is None:
             continue
-        if m_decl := _DECL_RE.match(line):
-            kind, name, explicit_ty, rhs = (
-                (m_decl.group(1), m_decl.group(2), m_decl.group(3), m_decl.group(4) or "")
-                if m_decl.group(1)
-                else ("var", m_decl.group(5), None, m_decl.group(6))
-            )
-            if m_fn := _FN_LIT_RE.search(rhs):
-                closures[name] = ({p.strip().split()[0] for p in m_fn.group("params").split(",") if p.strip()}, m_fn.group("body"))
-                continue
-            ty, root = _infer_type(rhs, explicit_ty, env)
-            env[name] = Binding(name=name, kind=kind, ty=ty, root=root or name)
+        kind, name, explicit_ty = (m_decl.group(1), m_decl.group(2), m_decl.group(3)) if m_decl.group(1) else ("var", m_decl.group(5), None)
+        if call_info is None and (m_fn := _FN_LIT_RE.search(rhs)):
+            closures[name] = ({p.strip().split()[0] for p in m_fn.group("params").split(",") if p.strip()}, m_fn.group("body"))
+            continue
+        ty, root = _infer_type(rhs, explicit_ty, env)
+        env[name] = Binding(name=name, kind=kind, ty=ty, root=root or name)
     return diags
 
 
@@ -191,16 +208,24 @@ def audit_live_corpus(repo_root: Path | None = None) -> dict[str, Any]:
     f2_ok = [(d.code, d.subject) for d in check_program(f2_src)] == [("HYB-E5202", "counts")]
     f3_ok = [(d.code, d.subject) for d in check_program(f3_src)] == [("HYB-E5203", "foreign.register_hook")]
     ex_files = sorted((root / "examples").glob("*/program.hy"))
-    ex_diags = {p.parent.name: [asdict(d) for d in check_program(p.read_text(encoding="utf-8"))] for p in ex_files}
+    stats: dict[str, int] = {}
+    ex_texts = {p.parent.name: p.read_text(encoding="utf-8") for p in ex_files}
+    ex_diags = {name: [asdict(d) for d in check_program(text, stats=stats)] for name, text in ex_texts.items()}
     ex_fp = sum(len(v) for v in ex_diags.values())
     c10_path = root / "tests" / "checker-corpus" / "10-a5-http-handler-capture.hy"
-    c10_diags = [asdict(d) for d in check_program(c10_path.read_text(encoding="utf-8"))] if c10_path.exists() else []
+    c10_text = c10_path.read_text(encoding="utf-8") if c10_path.exists() else ""
+    c10_diags = [asdict(d) for d in check_program(c10_text)] if c10_text else []
     c10_ok = [(d["code"], d["subject"]) for d in c10_diags] == [("HYB-E5202", "hits")]
+    ex06_text = ex_texts.get("06-http-server", "")
+    rename = lambda text: re.sub(r"\bmux\b", "router", text)  # noqa: E731
+    renamed_ok = bool(c10_text and ex06_text) and [(d.code, d.subject) for d in check_program(rename(c10_text))] == [("HYB-E5202", "hits")] and check_program(rename(ex06_text)) == []
     return {
         "issue": 1256, "f1_pass": f1_ok, "f2_pass": f2_ok, "f3_pass": f3_ok,
         "examples_total": len(ex_files), "examples_clean": sum(1 for v in ex_diags.values() if not v),
-        "examples_false_positives": ex_fp, "contested_10_a5_flipped": c10_ok, "contested_10_a5_diags": c10_diags,
-        "all_passed": bool(f1_ok and f2_ok and f3_ok and ex_files and ex_fp == 0 and c10_ok),
+        "examples_false_positives": ex_fp, "examples_with_callbacks": sum(1 for t in ex_texts.values() if "fn(" in t),
+        "callback_call_sites": stats.get("call_sites", 0), "renamed_receiver_ok": renamed_ok,
+        "contested_10_a5_flipped": c10_ok, "contested_10_a5_diags": c10_diags,
+        "all_passed": bool(f1_ok and f2_ok and f3_ok and ex_files and ex_fp == 0 and c10_ok and renamed_ok),
     }
 
 
@@ -215,8 +240,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"W-052 check: F1={report['f1_pass']} F2={report['f2_pass']} F3={report['f3_pass']} "
-            f"examples={report['examples_clean']}/{report['examples_total']} (fp={report['examples_false_positives']}) "
-            f"contested_10_a5_flipped={report['contested_10_a5_flipped']} all_passed={report['all_passed']}"
+            f"examples={report['examples_clean']}/{report['examples_total']} (diags={report['examples_false_positives']}, "
+            f"with_callbacks={report['examples_with_callbacks']}, callback_call_sites={report['callback_call_sites']}) "
+            f"renamed_receiver_ok={report['renamed_receiver_ok']} "
+            f"contested_10_a5_flipped(model)={report['contested_10_a5_flipped']} all_passed={report['all_passed']}"
         )
     return 0 if report["all_passed"] else 1
 
