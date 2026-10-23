@@ -43,7 +43,7 @@ fn local_and_closure_const_chains_and_block_shadowing_reject_with_e6003() {
 }
 
 #[test]
-fn shadowed_conversion_or_len_and_named_args_reject_with_e6003() {
+fn shadowed_conversion_or_len_reject_with_e6003() {
     assert_has(&check("package main\nenum msg { int8(int) }\nconst c = int8(42)\nfn main() { _ = c }\n"), "HYB-E6003");
     assert_has(&check("package main\nenum msg { len(string) }\nconst n = len(\"hello\")\nfn main() { _ = n }\n"), "HYB-E6003");
     assert_has(&check("package main\nenum msg { string(int) }\nconst n = len(string(65))\nfn main() { _ = n }\n"), "HYB-E6003");
@@ -53,11 +53,14 @@ fn shadowed_conversion_or_len_and_named_args_reject_with_e6003() {
     let r_const_shadow = check("package main\nconst int8 = [1, 2]\nconst len = [1, 2]\nconst c = int8(0)\nconst n = len(\"hello\")\nfn main() { _ = int8\n _ = len\n _ = c\n _ = n }\n");
     assert_eq!(count_code(&r_const_shadow, "HYB-E6003"), 2, "{:?}", r_const_shadow.diagnostics);
     assert_has(&check("package main\nimport \"int8\"\nconst c = int8(42)\nfn main() { _ = c }\n"), "HYB-E6003");
-    let r_named = check("package main\nconst c = int8(x = 42)\nconst n = len(s = \"hello\")\nfn main() { _ = c\n _ = n }\n");
-    assert_eq!(count_code(&r_named, "HYB-E6003"), 2, "{:?}", r_named.diagnostics);
 }
 
 #[test]
 fn local_const_chain_with_spec_conversions_and_type_aliases_is_accepted() {
     assert_accepts("package main\ntype my_str = string\ntype my_char = char\ntype my_int = i32\nfn main() {\n    const a = f64(42)\n    const a2 = a + 1.0\n    const b = u8(7)\n    const b2 = b + 1\n    const c = my_char(65)\n    const c2 = c\n    const d = my_int(10)\n    const d2 = d + 5\n    const s = my_str(\"hello\")\n    const n = len(s)\n    int8 := 99\n    const after_shadow = d2 + 1\n    f := fn() {\n        const cs = my_str(\"world\")\n        const cn = len(cs)\n        _ = cn\n    }\n    f()\n    _ = a2\n    _ = b2\n    _ = c2\n    _ = d2\n    _ = n\n    _ = int8\n    _ = after_shadow\n}\n");
+}
+
+#[test]
+fn named_argument_in_const_scalar_conversion_is_accepted() {
+    assert_accepts("package main\nconst c = int8(x = 42)\nfn main() { _ = c }\n");
 }

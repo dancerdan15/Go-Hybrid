@@ -95,7 +95,7 @@ impl<'a> Checker<'a> {
                 let Some(ty_name) = conversion_callee_name(callee) else {
                     return false;
                 };
-                if self.is_callee_shadowed(ty_name, callee.span().start, st) || args.len() != 1 || args[0].spread || args[0].name.is_some() {
+                if self.is_callee_shadowed(ty_name, callee.span().start, st) || args.len() != 1 || args[0].spread {
                     return false;
                 }
                 if ty_name == "len" {
@@ -175,7 +175,7 @@ impl<'a> Checker<'a> {
                 };
                 !self.is_callee_shadowed(ty_name, callee.span().start, st) && self.is_const_conversion_target(ty_name, true)
                     && args.len() == 1
-                    && !args[0].spread && args[0].name.is_none()
+                    && !args[0].spread
             }
             _ => false,
         }
