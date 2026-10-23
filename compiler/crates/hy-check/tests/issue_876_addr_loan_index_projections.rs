@@ -1,7 +1,9 @@
 //! issue_876_addr_loan_index_projections.rs — Fail-to-Pass regression tests
 //! for #876 (T24, HYB-E3104): taking the address of index and mixed
 //! field/index projections rooted at an O8 map-slot loan (`&n.arr[0]`,
-//! `&n[0]`, `&n.arr[0].x`), plus positive control for nested map-slot loans.
+//! `&n[0]`, `&n.arr[0].x`), plus positive controls for nested map-slot loans
+//! and for slice-field index projections (`&n.sl[0]`, `touch(n.sl[0])`,
+//! `&n.sl[0].x`), whose elements live in a shared backing array.
 
 use hy_check::{check_file, Verdict};
 use hy_diag::Severity;
@@ -48,6 +50,14 @@ fn addr_of_mixed_index_and_field_projection_on_slot_loan_is_rejected_e3104() {
 #[test]
 fn nested_map_slot_loan_through_loan_field_is_accepted() {
     let src = "struct bucket { sub map[string]int }\n\nfn main() {\n    m := map[string]bucket{\"a\": bucket{sub: map[string]int{\"k\": 7}}}\n    n := &m[\"a\"]\n    sub := &n.sub[\"k\"]\n    fmt.println(sub)\n}\n";
+    let r = check(src);
+    assert!(codes(&r).is_empty(), "unexpected diagnostics: {:?}", r.diagnostics);
+    assert_eq!(r.verdict, Verdict::Accept);
+}
+
+#[test]
+fn slice_field_index_projection_on_slot_loan_is_accepted() {
+    let src = "struct item {\n    x int\n}\nstruct node {\n    sl []item\n}\nfn touch(p *item) {\n    p.x = 77\n}\n\nfn main() {\n    m := map[string]node{\"a\": node{sl: []item{item{x: 1}, item{x: 2}}}}\n    n := &m[\"a\"]\n    p := &n.sl[0]\n    p.x = 99\n    touch(n.sl[0])\n    q := &n.sl[0].x\n    fmt.println(p)\n    fmt.println(q)\n    fmt.println(m[\"a\"].sl[0].x)\n}\n";
     let r = check(src);
     assert!(codes(&r).is_empty(), "unexpected diagnostics: {:?}", r.diagnostics);
     assert_eq!(r.verdict, Verdict::Accept);

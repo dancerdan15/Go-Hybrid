@@ -24,12 +24,12 @@ fn codes(r: &hy_check::CheckResult) -> Vec<String> {
 
 #[test]
 fn auto_addressed_pointer_param_on_slot_loan_projections_is_rejected_e3104() {
-    let src_index = "struct node { arr [2]int, val int }\nfn touch(p *int) { fmt.println(p) }\n\nfn main() {\n    m := map[string]node{\"a\": node{arr: [2]int{10, 20}, val: 3}}\n    n := &m[\"a\"]\n    touch(n.arr[0])\n}\n";
+    let src_index = "struct node {\n    arr [2]int\n    val int\n}\nfn touch(p *int) { fmt.println(p) }\n\nfn main() {\n    m := map[string]node{\"a\": node{arr: [2]int{10, 20}, val: 3}}\n    n := &m[\"a\"]\n    touch(n.arr[0])\n}\n";
     let r_index = check(src_index);
     assert_eq!(codes(&r_index), vec!["HYB-E3104".to_string()]);
     assert_eq!(r_index.verdict, Verdict::Reject);
 
-    let src_field = "struct node { arr [2]int, val int }\nfn touch(p *int) { fmt.println(p) }\n\nfn main() {\n    m := map[string]node{\"a\": node{arr: [2]int{10, 20}, val: 3}}\n    n := &m[\"a\"]\n    touch(n.val)\n}\n";
+    let src_field = "struct node {\n    arr [2]int\n    val int\n}\nfn touch(p *int) { fmt.println(p) }\n\nfn main() {\n    m := map[string]node{\"a\": node{arr: [2]int{10, 20}, val: 3}}\n    n := &m[\"a\"]\n    touch(n.val)\n}\n";
     let r_field = check(src_field);
     assert_eq!(codes(&r_field), vec!["HYB-E3104".to_string()]);
     assert_eq!(r_field.verdict, Verdict::Reject);

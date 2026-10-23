@@ -473,8 +473,10 @@ impl<'a> Checker<'a> {
                 Expr::Ident { name, .. } => return Some(name.as_str()),
                 Expr::Field { base, .. } => cur = base,
                 Expr::Index { base, .. } => match self.shape_of_expr(st, base) {
-                    TypeShape::Map(..) => return None,
-                    TypeShape::Pointer(p) if matches!(*p, TypeShape::Map(..)) => return None,
+                    // Map and slice bases end the walk: slice elements live in a
+                    // shared backing array, not in the loan's by-value storage.
+                    TypeShape::Map(..) | TypeShape::Slice(..) => return None,
+                    TypeShape::Pointer(p) if matches!(*p, TypeShape::Map(..) | TypeShape::Slice(..)) => return None,
                     _ => cur = base,
                 },
                 _ => return None,
