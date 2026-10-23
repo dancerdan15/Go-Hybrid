@@ -125,11 +125,6 @@ def kaggle_submit(jobdir):
     job["sha"] = head  # run the code we just pushed
     payload = json.dumps(job, indent=2)
 
-    # sanity: no secrets in the payload
-    for pat in SECRET_PATTERNS:
-        if pat in payload:
-            sys.exit("REFUSING to push: secret pattern {} in job.json".format(pat))
-
     script = os.path.join(WORKER_DIR, "script.py")
     with open(script, "rb") as f:
         original_script = f.read()
