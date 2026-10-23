@@ -13,6 +13,10 @@ use crate::model::{unwrap_parens, Checker};
 use hy_diag::{Diagnostic, Span};
 use hy_syntax::{Expr, ForKind, LitKind, Place, PlaceKind, SelectArmKind, Stmt, UnOp};
 
+pub(crate) const VALUE_ONLY_BUILTINS: &[&str] = &[
+    "append", "cap", "complex", "imag", "len", "make", "max", "min", "new", "real",
+];
+
 impl<'a> Checker<'a> {
     /// Pass-B entry: HYB-E2001 on `defer` + HYB-E2005 on builtin calls.
     /// Nested block bodies are NOT recursed — `walk::flatten` already lists
@@ -22,29 +26,123 @@ impl<'a> Checker<'a> {
         self.check_stmt_builtin_args_inner(stmt, /*deep=*/ false);
     }
 
+    fn is_shadowed_in_fn(&self, name: &str, span: Span) -> bool {
+        self.fns.contains_key(name)
+            || self.consts.contains_key(name)
+            || self.file.fns().any(|f| {
+                f.span.start.line <= span.start.line
+                    && span.end.line <= f.span.end.line
+                    && (f.receiver.as_ref().is_some_and(|r| r.name == name)
+                        || f.params.iter().any(|p| p.name == name)
+                        || f.results.iter().any(|r| r.name.as_deref() == Some(name))
+                        || f.body.as_ref().is_some_and(|b| {
+                            crate::walk::flatten(b)
+                                .stmts
+                                .iter()
+                                .any(|(s, _)| stmt_declares(s, name))
+                        }))
+            })
+    }
+
+    fn classify_value_only_callee(&self, callee: &Expr, span: Span) -> Option<(bool, String)> {
+        let bare = unwrap_parens(callee);
+        match bare {
+            Expr::Ident { name, .. } => {
+                let base = Self::base_named_type_str(name);
+                if self.is_shadowed_in_fn(base, span) {
+                    return None;
+                }
+                if VALUE_ONLY_BUILTINS.contains(&base) {
+                    return Some((true, base.to_string()));
+                }
+                if crate::const_init::is_conversion_type_name(base)
+                    || matches!(base, "any" | "error" | "complex64" | "complex128")
+                    || self.structs.contains_key(base)
+                    || self.struct_type_params.contains_key(base)
+                    || self.type_aliases.contains_key(base)
+                {
+                    return Some((false, bare.render()));
+                }
+                None
+            }
+            Expr::SliceLit {
+                elem: Some(_),
+                items,
+                ..
+            } if items.is_empty() => Some((false, bare.render())),
+            _ => None,
+        }
+    }
+
     pub(crate) fn check_stmt_defer_call(&mut self, stmt: &Stmt) {
         let Stmt::Defer { call, span } = stmt else {
             return;
         };
         let mut e = unwrap_parens(call);
         // `defer f.close()?` — Try wrapping a call is the documented form.
-        if let Expr::Try { operand, .. } = e {
+        while let Expr::Try { operand, .. } = e {
             e = unwrap_parens(operand);
         }
-        if matches!(e, Expr::Call { .. }) {
+        let Expr::Call { callee, .. } = e else {
+            self.diags.push(
+                Diagnostic::error(
+                    "HYB-E2001",
+                    self.path.clone(),
+                    *span,
+                    "defer requires a call expression (HYB-E2001)",
+                )
+                .with_notes(vec![
+                    "Go's defer operand must be a function call; Hybrid matches that contract so accepted programs emit buildable Go".to_string(),
+                    "defer the call itself: `defer f.close()?` / `defer close(ch)` — not a bare ident, receive, or send".to_string(),
+                ]),
+            );
             return;
+        };
+        if let Some((is_builtin, name)) = self.classify_value_only_callee(callee, *span) {
+            let (msg, note) = if is_builtin {
+                (
+                    format!("cannot defer `{name}`: defer discards result of `{name}` (HYB-E2001)"),
+                    "in Go, builtins that produce values without side-effects cannot be deferred; call a function or method that performs clean-up actions",
+                )
+            } else {
+                (
+                    format!("cannot defer type conversion `{name}`: defer discards result of conversion (HYB-E2001)"),
+                    "a type conversion is not a function call and produces a value that cannot be discarded in defer",
+                )
+            };
+            self.diags.push(
+                Diagnostic::error("HYB-E2001", self.path.clone(), *span, msg)
+                    .with_notes(vec![note.to_string()]),
+            );
         }
+    }
+
+    fn check_stmt_expr_value(&mut self, expr: &Expr, span: Span) {
+        let mut e = unwrap_parens(expr);
+        while let Expr::Try { operand, .. } = e {
+            e = unwrap_parens(operand);
+        }
+        let (msg, note) = match e {
+            Expr::Receive { .. } => return,
+            Expr::Call { callee, .. } => match self.classify_value_only_callee(callee, span) {
+                None => return,
+                Some((true, name)) => (
+                    format!("`{name}(...)` evaluated but not used — Go refuses `{name}(...) is not used` (HYB-E1002)"),
+                    "builtins that produce values must be assigned or used; they cannot be expression statements",
+                ),
+                Some((false, target)) => (
+                    format!("type conversion `{target}(...)` evaluated but not used — Go refuses `conversion to {target} is not used` (HYB-E1002)"),
+                    "type conversions produce values that must be assigned, passed, or returned; a conversion cannot appear as an expression statement",
+                ),
+            },
+            _ => (
+                format!("`{}` evaluated but not used — expression has no side-effects in statement context (HYB-E1002)", expr.render()),
+                "an expression statement must have side-effects: a function call, method call, or channel receive; to discard a value, write `_ = expr`",
+            ),
+        };
         self.diags.push(
-            Diagnostic::error(
-                "HYB-E2001",
-                self.path.clone(),
-                *span,
-                "defer requires a call expression (HYB-E2001)",
-            )
-            .with_notes(vec![
-                "Go's defer operand must be a function call; Hybrid matches that contract so accepted programs emit buildable Go".to_string(),
-                "defer the call itself: `defer f.close()?` / `defer close(ch)` — not a bare ident, receive, or send".to_string(),
-            ]),
+            Diagnostic::error("HYB-E1002", self.path.clone(), span, msg)
+                .with_notes(vec![note.to_string()]),
         );
     }
 
@@ -65,7 +163,10 @@ impl<'a> Checker<'a> {
                     self.check_expr_builtin_args(v);
                 }
             }
-            Stmt::Expr { expr, .. } => self.check_expr_builtin_args(expr),
+            Stmt::Expr { expr, span } => {
+                self.check_stmt_expr_value(expr, *span);
+                self.check_expr_builtin_args(expr);
+            }
             Stmt::Send { chan, value, .. } => {
                 self.check_expr_builtin_args(chan);
                 self.check_expr_builtin_args(value);
@@ -188,7 +289,7 @@ impl<'a> Checker<'a> {
                 let is_type_arg_builtin = matches!(
                     unwrap_parens(callee),
                     Expr::Ident { name, .. }
-                        if (name == "make" || name == "new") && !self.fns.contains_key(name.as_str())
+                        if (name == "make" || name == "new") && !self.is_shadowed_in_fn(name, *span)
                 );
                 for (i, a) in args.iter().enumerate() {
                     if is_type_arg_builtin && i == 0 {
@@ -267,7 +368,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_builtin_call(&mut self, name: &str, args: &[hy_syntax::CallArg], span: Span) {
-        if self.fns.contains_key(name) {
+        if self.is_shadowed_in_fn(name, span) {
             return;
         }
         match name {
@@ -697,4 +798,29 @@ fn is_string_literal(e: &Expr) -> bool {
             ..
         }
     )
+}
+
+fn expr_declares(e: &Expr, name: &str) -> bool {
+    match unwrap_parens(e) {
+        Expr::FnLit { params, results, body, .. } => {
+            params.iter().any(|p| p.name == name)
+                || results.iter().any(|r| r.name.as_deref() == Some(name))
+                || crate::walk::flatten(body).stmts.iter().any(|(s, _)| stmt_declares(s, name))
+        }
+        Expr::Call { callee, args, .. } => {
+            expr_declares(callee, name) || args.iter().any(|a| expr_declares(&a.value, name))
+        }
+        _ => false,
+    }
+}
+
+fn stmt_declares(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Local(l) => l.names.iter().any(|n| n == name) || l.values.iter().any(|v| expr_declares(v, name)),
+        Stmt::For { kind: ForKind::Range { var, .. }, .. } => var == name,
+        Stmt::For { kind: ForKind::Iterate { vars, .. }, .. } => vars.iter().any(|v| v == name),
+        Stmt::Assign { values, .. } | Stmt::Return { values, .. } => values.iter().any(|v| expr_declares(v, name)),
+        Stmt::Expr { expr, .. } | Stmt::Defer { call: expr, .. } => expr_declares(expr, name),
+        _ => false,
+    }
 }
