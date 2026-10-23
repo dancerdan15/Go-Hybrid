@@ -96,12 +96,15 @@ impl<'a> Checker<'a> {
                             .iter()
                             .zip(l.values.iter())
                             .map(|(name, val)| {
-                                let inferred = self.shape_of_expr(st, val);
-                                let shape = match (&l.ty, inferred) {
-                                    (Some(t), TypeShape::Unknown) => self.shape_of_type(t),
-                                    (_, s) => s,
+                                let ty =
+                                    l.ty.clone().or_else(|| self.recv_chan_type_expr(st, val));
+                                let shape = match self.shape_of_expr(st, val) {
+                                    TypeShape::Unknown => ty
+                                        .as_ref()
+                                        .map(|t| self.shape_of_type(t))
+                                        .unwrap_or(TypeShape::Unknown),
+                                    s => s,
                                 };
-                                let ty = l.ty.clone().or_else(|| self.ty_of_expr(st, val));
                                 (name, shape, ty)
                             })
                             .collect();
@@ -286,17 +289,30 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Field { base, .. } => self.check_expr_recv_operands(st, base),
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { ty, fields, .. } => {
+                if let Some(ty) = ty {
+                    self.check_type_recv_operands(st, ty);
+                }
                 for f in fields {
                     self.check_expr_recv_operands(st, &f.value);
                 }
             }
-            Expr::SliceLit { items, .. } => {
+            Expr::SliceLit { elem, items, .. } => {
+                if let Some(elem) = elem {
+                    self.check_type_recv_operands(st, elem);
+                }
                 for it in items {
                     self.check_expr_recv_operands(st, it);
                 }
             }
-            Expr::MapLit { entries, .. } => {
+            Expr::MapLit {
+                key,
+                value,
+                entries,
+                ..
+            } => {
+                self.check_type_recv_operands(st, key);
+                self.check_type_recv_operands(st, value);
                 for (k, v) in entries {
                     self.check_expr_recv_operands(st, k);
                     self.check_expr_recv_operands(st, v);
@@ -309,24 +325,104 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Expr::FnLit { .. } | Expr::Ident { .. } | Expr::Lit { .. } => {}
+            Expr::FnLit {
+                params, results, ..
+            } => {
+                for p in params {
+                    self.check_type_recv_operands(st, &p.ty);
+                }
+                for r in results {
+                    self.check_type_recv_operands(st, &r.ty);
+                }
+            }
+            Expr::Ident { .. } | Expr::Lit { .. } => {}
         }
     }
 
     fn recv_chan_type_expr(&self, st: &FnState, expr: &Expr) -> Option<hy_syntax::TypeExpr> {
+        match expr {
+            Expr::Paren { inner, .. } | Expr::Move { operand: inner, .. } => {
+                return self.recv_chan_type_expr(st, inner);
+            }
+            Expr::Try { operand, .. } => {
+                let ty = self
+                    .recv_chan_type_expr(st, operand)
+                    .or_else(|| self.ty_of_expr(st, expr))?;
+                return match self.resolve_type_alias(&ty) {
+                    hy_syntax::TypeExpr::Option { elem, .. } => Some(*elem),
+                    _ => Some(ty),
+                };
+            }
+            Expr::Call { callee, args, span } => match crate::model::unwrap_parens(callee) {
+                Expr::Ident { name, .. } if name == "some" => {
+                    let elem = self.recv_chan_type_expr(st, &args.first()?.value)?;
+                    return Some(hy_syntax::TypeExpr::Option {
+                        elem: Box::new(elem),
+                        span: *span,
+                    });
+                }
+                Expr::Field { base, name, .. } => {
+                    let head = Self::base_named_type_str(name);
+                    if (head == "unwrap" && args.is_empty()) || (head == "or" && args.len() == 1) {
+                        if let Some(hy_syntax::TypeExpr::Option { elem, .. }) = self
+                            .recv_chan_type_expr(st, base)
+                            .map(|t| self.resolve_type_alias(&t))
+                        {
+                            return Some(*elem);
+                        }
+                        if head == "or" {
+                            return self.recv_chan_type_expr(st, &args[0].value);
+                        }
+                        return None;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         if let Some(ty) = self.ty_of_expr(st, expr) {
-            return Some(ty);
+            if !matches!(
+                &ty,
+                hy_syntax::TypeExpr::Option { elem, .. }
+                    if matches!(&**elem, hy_syntax::TypeExpr::Named { name, .. } if name == "any")
+            ) {
+                return Some(ty);
+            }
         }
         match expr {
-            Expr::Paren { inner, .. }
-            | Expr::Move { operand: inner, .. }
-            | Expr::Try { operand: inner, .. } => self.recv_chan_type_expr(st, inner),
+            Expr::Ident { name, .. } => {
+                let root = crate::freeze::resolve_alias(st, name);
+                self.lookup_binding(st, &root).and_then(|b| b.ty.clone())
+            }
             Expr::Receive { chan, .. } => {
                 let outer_ty = self.recv_chan_type_expr(st, chan)?;
                 match self.resolve_type_alias(&outer_ty) {
                     hy_syntax::TypeExpr::Chan { elem, .. } => Some(*elem),
                     _ => None,
                 }
+            }
+            Expr::Index { base, .. } => {
+                let mut cur = self.resolve_type_alias(&self.recv_chan_type_expr(st, base)?);
+                while let hy_syntax::TypeExpr::Pointer { to, .. } = cur {
+                    cur = self.resolve_type_alias(&to);
+                }
+                match cur {
+                    hy_syntax::TypeExpr::Slice { elem, .. }
+                    | hy_syntax::TypeExpr::Array { elem, .. }
+                    | hy_syntax::TypeExpr::Map { value: elem, .. } => Some(*elem),
+                    _ => None,
+                }
+            }
+            Expr::Field { base, name, .. } => {
+                let mut cur = self.resolve_type_alias(&self.recv_chan_type_expr(st, base)?);
+                while let hy_syntax::TypeExpr::Pointer { to, .. } = cur {
+                    cur = self.resolve_type_alias(&to);
+                }
+                let sname = Self::base_named_type(&cur)?;
+                self.structs
+                    .get(&sname)
+                    .and_then(|fs| fs.iter().find(|(n, _)| n == name))
+                    .map(|(_, t)| t.clone())
             }
             _ => None,
         }
@@ -340,7 +436,14 @@ impl<'a> Checker<'a> {
     /// side, an ill-typed source is not a sendability doubt — `managed`
     /// does not suppress it.
     pub(crate) fn check_recv_operand(&mut self, st: &FnState, chan: &Expr, span: Span) -> bool {
-        match self.shape_of_expr(st, chan) {
+        let shape = match self.shape_of_expr(st, chan) {
+            TypeShape::Unknown => self
+                .recv_chan_type_expr(st, chan)
+                .map(|t| self.shape_of_type(&t))
+                .unwrap_or(TypeShape::Unknown),
+            s => s,
+        };
+        match shape {
             TypeShape::Chan(_) => {
                 if let Some(ty) = self.recv_chan_type_expr(st, chan) {
                     let resolved = self.resolve_type_alias(&ty);
