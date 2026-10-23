@@ -387,38 +387,3 @@ fn expr_reads_before_range_bind(e: &Expr, target: &str) -> bool {
         }
     }
 }
-
-#[allow(dead_code)]
-pub fn range_hi_shadows_loop_var(var: &str, hi: &Expr) -> bool {
-    var != "_" && expr_reads(hi, var)
-}
-
-#[allow(dead_code)]
-pub fn range_hi_needs_hoist(var: &str, hi: &Expr, body: &[Stmt]) -> bool {
-    !matches!(hi, Expr::Lit { .. })
-        && (range_hi_shadows_loop_var(var, hi)
-            || expr_has_call_or_recv(hi)
-            || stmts_mutate_expr_reads(body, hi))
-}
-
-#[allow(dead_code)]
-pub fn range_bound_temp_name(var: &str, line: usize) -> String {
-    format!("__hyb_hi_{}_{}", if var == "_" { "idx" } else { var }, line)
-}
-
-fn stmts_mutate_expr_reads(stmts: &[Stmt], hi: &Expr) -> bool {
-    stmts.iter().any(|s| match s {
-        Stmt::Assign { targets, .. } => targets.iter().any(|t| expr_reads(hi, t.root())),
-        Stmt::If { init, then, otherwise, .. } => {
-            init.as_deref().is_some_and(|i| stmts_mutate_expr_reads(std::slice::from_ref(i), hi))
-                || stmts_mutate_expr_reads(&then.stmts, hi)
-                || otherwise.as_deref().is_some_and(|o| stmts_mutate_expr_reads(std::slice::from_ref(o), hi))
-        }
-        Stmt::For { body, .. } | Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
-            stmts_mutate_expr_reads(&body.stmts, hi)
-        }
-        Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_mutate_expr_reads(&a.body.stmts, hi)),
-        Stmt::Select { arms, .. } => arms.iter().any(|a| stmts_mutate_expr_reads(&a.body.stmts, hi)),
-        _ => false,
-    })
-}

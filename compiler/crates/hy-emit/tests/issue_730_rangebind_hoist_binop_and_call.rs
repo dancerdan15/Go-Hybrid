@@ -47,10 +47,17 @@ fn check(x int) (bool, error) {
     return x > 0, nil
 }
 
+fn pick(b bool) int {
+    if b {
+        return 1
+    }
+    return 0
+}
+
 fn run_short_circuit_and_inclusive(xs []int) (int, error) {
     for i, v in xs {
         fmt.println(i)
-        for v in 0..(v > 0 && check(v)?) {
+        for v in 0..pick(v > 0 && check(v)?) {
             fmt.println(v)
         }
     }
