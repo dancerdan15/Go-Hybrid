@@ -371,7 +371,7 @@ impl<'a> Checker<'a> {
                             return Some((name.clone(), decl.results.len()));
                         }
                     }
-                    return None;
+                    return self.callee_fn_results(st, callee).map(|n| (name.clone(), n));
                 }
                 // 2. Direct call to a file-local top-level function
                 let head = Self::base_named_type_str(name);
@@ -420,20 +420,138 @@ impl<'a> Checker<'a> {
                     }
                 }
                 // 3. Struct field holding a fn value (`h.mm(3, 9)`)
-                let callee_ty = self.ty_of_expr(st, callee)?;
-                if let TypeExpr::Fn { results, .. } = self.resolve_type_alias(&callee_ty) {
-                    return Some((callee.render(), results.len()));
-                }
-                None
+                self.callee_fn_results(st, callee).map(|n| (callee.render(), n))
             }
-            other => {
-                let callee_ty = self.ty_of_expr(st, other)?;
-                if let TypeExpr::Fn { results, .. } = self.resolve_type_alias(&callee_ty) {
-                    return Some((callee.render(), results.len()));
-                }
-                None
-            }
+            other => self.callee_fn_results(st, other).map(|n| (callee.render(), n)),
         }
     }
+
+    fn callee_fn_results(&self, st: &FnState, expr: &Expr) -> Option<usize> {
+        match self.resolve_type_alias(&self.resolved_callee_ty(st, expr, 0)?) {
+            TypeExpr::Fn { results, .. } => Some(results.len()),
+            _ => None,
+        }
+    }
+
+    fn resolved_callee_ty(&self, st: &FnState, expr: &Expr, depth: usize) -> Option<TypeExpr> {
+        if depth > 8 {
+            return None;
+        }
+        match unwrap_parens_and_move(expr) {
+            Expr::Ident { name, span } => self
+                .ty_of_expr(st, expr)
+                .or_else(|| self.infer_untyped_binding_ty(st, name, *span, depth + 1)),
+            Expr::Field { base, name, span } => {
+                let bt = self.resolve_type_alias(&self.resolved_callee_ty(st, base, depth + 1)?);
+                let sname = Self::base_named_type(&bt)?;
+                let mkey = (sname.clone(), Self::base_named_type_str(name).to_string());
+                if let Some(d) = self.method_decls.get(&mkey) {
+                    return Some(TypeExpr::Fn {
+                        params: Vec::new(),
+                        results: d.results.iter().map(|r| r.ty.clone()).collect(),
+                        span: *span,
+                    });
+                }
+                let (_, raw_ty) = self.structs.get(&sname)?.iter().find(|(n, _)| n == name)?;
+                if let (TypeExpr::Named { name: bname, .. }, TypeExpr::Named { name: tp, .. }) =
+                    (&bt, raw_ty)
+                {
+                    if let Some(idx) = self
+                        .struct_type_params
+                        .get(&sname)
+                        .and_then(|ps| ps.iter().position(|p| &p.name == tp))
+                    {
+                        return parse_nth_type_arg(bname, idx);
+                    }
+                }
+                Some(raw_ty.clone())
+            }
+            Expr::Index { base, .. } => {
+                match self.resolve_type_alias(&self.resolved_callee_ty(st, base, depth + 1)?) {
+                    t @ TypeExpr::Fn { .. } => Some(t),
+                    TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } => Some(*elem),
+                    TypeExpr::Map { value, .. } => Some(*value),
+                    _ => self.ty_of_expr(st, expr),
+                }
+            }
+            Expr::Receive { chan, .. } => self.chan_elem_ty(st, chan),
+            Expr::Call { callee, .. } => {
+                match self.resolve_type_alias(&self.resolved_callee_ty(st, callee, depth + 1)?) {
+                    TypeExpr::Fn { results, .. } => results.first().cloned(),
+                    _ => self.ty_of_expr(st, expr),
+                }
+            }
+            _ => self.ty_of_expr(st, expr),
+        }
+    }
+
+    fn infer_untyped_binding_ty(&self, st: &FnState, target: &str, use_span: Span, depth: usize) -> Option<TypeExpr> {
+        let mut out = None;
+        let mut blocks: Vec<_> = self.file.fns().filter(|f| span_contains(f.span, use_span)).filter_map(|f| f.body.as_ref()).collect();
+        while let Some(body) = blocks.pop() {
+            for (stmt, _) in crate::walk::flatten(body).stmts {
+                if (stmt.span().start.line, stmt.span().start.col) > (use_span.start.line, use_span.start.col) {
+                    continue;
+                }
+                let mut fnlits = Vec::new();
+                crate::walk::own_fnlits(stmt, &mut fnlits);
+                for fl in fnlits {
+                    if let Expr::FnLit { body: fb, span, .. } = fl {
+                        if span_contains(*span, use_span) {
+                            blocks.push(fb);
+                        }
+                    }
+                }
+                match stmt {
+                    Stmt::Local(l) => {
+                        for (n, v) in l.names.iter().zip(&l.values) {
+                            if n == target {
+                                out = self.resolved_callee_ty(st, v, depth + 1);
+                            }
+                        }
+                    }
+                    Stmt::Assign { targets, op: AssignOp::Assign, values, .. } => {
+                        for (t, v) in targets.iter().zip(values) {
+                            if matches!(&t.kind, PlaceKind::Ident(n) if n == target) {
+                                out = self.resolved_callee_ty(st, v, depth + 1);
+                            }
+                        }
+                    }
+                    Stmt::For { kind: ForKind::Iterate { vars, expr }, span, .. } if span_contains(*span, use_span) => {
+                        if let (Some(i), Some(ty)) = (vars.iter().position(|v| v == target), self.resolved_callee_ty(st, expr, depth + 1)) {
+                            out = match self.resolve_type_alias(&ty) {
+                                TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } if vars.len() == 1 || i == 1 => Some(*elem),
+                                TypeExpr::Map { key, value, .. } => Some(if vars.len() > 1 && i == 0 { *key } else { *value }),
+                                TypeExpr::Chan { elem, .. } if i == 0 => Some(*elem),
+                                _ => None,
+                            };
+                        }
+                    }
+                    Stmt::Select { arms, .. } => {
+                        for arm in arms.iter().filter(|a| span_contains(a.body.span, use_span)) {
+                            if let SelectArmKind::Recv { names, chan } = &arm.kind {
+                                if names.first().is_some_and(|n| n == target) {
+                                    out = self.chan_elem_ty(st, chan);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+}
+
+fn span_contains(outer: Span, inner: Span) -> bool {
+    (outer.start.line, outer.start.col) <= (inner.start.line, inner.start.col)
+        && (inner.end.line, inner.end.col) <= (outer.end.line, outer.end.col)
+}
+
+fn parse_nth_type_arg(name: &str, idx: usize) -> Option<TypeExpr> {
+    let inner = name.get(name.find('[')? + 1..name.strip_suffix(']')?.len())?;
+    let file = hy_syntax::parse_file("", &format!("fn _f() ({inner}) {{}}\n")).ok()?;
+    file.fns().next()?.results.get(idx).map(|r| r.ty.clone())
 }
 
