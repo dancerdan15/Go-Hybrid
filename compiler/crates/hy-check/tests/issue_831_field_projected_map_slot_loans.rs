@@ -81,3 +81,23 @@ fn valid_use_before_mutation(m map[string]*item, next *item) {
     let (verdict, codes) = check_codes(ok_src);
     assert_eq!(verdict, Verdict::Accept, "expected Accept, got: {codes:?}");
 }
+
+// A bare-identifier match pattern is a reference, not a binding (as resolve.rs treats it), so reading the moved-out outer variable must be rejected.
+#[test]
+fn bare_ident_match_pattern_is_a_reference_so_use_after_move_rejected() {
+    let src = r#"
+import "fmt"
+fn sink(m map[string]int) { fmt.println(len(m)) }
+fn f(sel map[string]int) {
+    owned := map[string]int{"k": 1}
+    sink(move owned)
+    match sel {
+        owned: { fmt.println(len(owned)) }
+        _: { fmt.println(0) }
+    }
+}
+"#;
+    let (verdict, codes) = check_codes(src);
+    assert_eq!(verdict, Verdict::Reject, "expected Reject, got: {codes:?}");
+    assert!(codes.iter().any(|c| c == "HYB-E3003"), "got: {codes:?}");
+}
