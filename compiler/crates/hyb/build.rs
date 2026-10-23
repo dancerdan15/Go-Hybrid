@@ -25,29 +25,64 @@ use std::process::Command;
 /// main.rs against tools/env.sh; this constant rides the same discipline.
 const DEFAULT_PIN: &str = "1.99.0";
 
+fn resolve_pinned_rust(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PIN)
+        .to_string()
+}
+
+fn allow_toolchain_drift(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+fn parse_rustc_version(stdout: &str) -> Option<&str> {
+    stdout.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("rustc ")?;
+        let version = rest.split_whitespace().next()?;
+        version
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+            .then_some(version)
+    })
+}
+
 fn main() {
     // Fix the stale-bake half: an override change must invalidate the build.
     println!("cargo:rerun-if-env-changed=HYB_PINNED_RUST");
     println!("cargo:rerun-if-env-changed=HYB_PINNED_GO");
+    println!("cargo:rerun-if-env-changed=HYB_ALLOW_TOOLCHAIN_DRIFT");
+    println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let pin = std::env::var("HYB_PINNED_RUST").unwrap_or_else(|_| DEFAULT_PIN.to_string());
+    let pin = resolve_pinned_rust(std::env::var("HYB_PINNED_RUST").ok().as_deref());
+    println!("cargo:rustc-env=HYB_PINNED_RUST={pin}");
+
+    if allow_toolchain_drift(std::env::var("HYB_ALLOW_TOOLCHAIN_DRIFT").ok().as_deref()) {
+        return;
+    }
 
     // Which rustc is compiling THIS crate? Cargo sets RUSTC for build
     // scripts; fall back to PATH lookup, and if neither yields a version,
     // SKIP the guard — never block a build on the guard itself (the
     // runtime HYB-E9001 check still governs every hyb build).
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let rustc = std::env::var("RUSTC")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "rustc".to_string());
     let Ok(out) = Command::new(&rustc).arg("--version").output() else {
         return;
     };
+    if !out.status.success() {
+        return;
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let found = stdout
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
-    if found.is_empty() || found == pin {
+    let Some(found) = parse_rustc_version(&stdout) else {
+        return;
+    };
+    if found == pin {
         return;
     }
 
