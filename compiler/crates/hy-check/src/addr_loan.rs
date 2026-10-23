@@ -33,14 +33,24 @@ fn is_slot_loan_expr(e: &Expr) -> bool {
 }
 
 impl<'a> Checker<'a> {
+    fn is_slot_loan_value(&self, st: &FnState, e: &Expr) -> bool {
+        if is_slot_loan_expr(e) {
+            return true;
+        }
+        match unwrap_parens(e) {
+            Expr::Ident { name, .. } => self.lookup_binding(st, name).is_some_and(|b| b.slot_loan),
+            _ => false,
+        }
+    }
+
     /// After `process_local`: flag every name bound to `&m[k]` (including
-    /// parenthesized `(&m[k])` and `&(m[k])`).
+    /// parenthesized `(&m[k])` and `&(m[k])`) or copied from a live slot loan.
     pub(crate) fn mark_slot_loans_local(&self, st: &mut FnState, l: &LocalDecl) {
         if l.names.len() != l.values.len() {
             return;
         }
         for (name, val) in l.names.iter().zip(l.values.iter()) {
-            if is_slot_loan_expr(val) {
+            if self.is_slot_loan_value(st, val) {
                 if let Some(b) = st.env_lookup_mut(name) {
                     b.slot_loan = true;
                 }
@@ -48,8 +58,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// After `process_assign`: `x = &m[k]` makes `x` a slot loan; any other
-    /// plain re-assignment of a whole binding clears the flag.
+    /// After `process_assign`: `x = &m[k]` (or a copy of a slot loan) makes `x`
+    /// a slot loan; a plain re-assignment in the binding's declaring scope
+    /// clears the flag.
     pub(crate) fn mark_slot_loans_assign(
         &self,
         st: &mut FnState,
@@ -60,11 +71,15 @@ impl<'a> Checker<'a> {
         if op != AssignOp::Assign || targets.len() != values.len() {
             return;
         }
-        for (t, v) in targets.iter().zip(values.iter()) {
+        let flags: Vec<bool> = values.iter().map(|v| self.is_slot_loan_value(st, v)).collect();
+        for ((t, v), is_loan) in targets.iter().zip(values.iter()).zip(flags) {
             if let PlaceKind::Ident(name) = &t.kind {
-                let is_loan = is_slot_loan_expr(v);
+                let is_loan = is_loan || self.is_slot_loan_value(st, v);
+                let same_scope = st.lookup_depth(name) == Some(st.scopes.len());
                 if let Some(b) = st.env_lookup_mut(name) {
-                    b.slot_loan = is_loan;
+                    if is_loan || same_scope {
+                        b.slot_loan = is_loan;
+                    }
                 }
             }
         }
@@ -162,20 +177,32 @@ impl<'a> Checker<'a> {
     ) {
         match stmt {
             Stmt::Local(l) => {
+                let par = (l.names.len() == l.values.len())
+                    .then(|| self.with_parallel_slot_loans(st, l.names.iter().map(String::as_str), &l.values))
+                    .flatten();
+                let (st_ref, direct) = (par.as_ref().unwrap_or(st), include_direct_ident || par.is_some());
                 for v in &l.values {
                     // `x := &m[k]` is the O8 slot-loan initializer: legal.
-                    self.walk_addr_of_loan_projections(st, v, include_direct_ident, true);
+                    self.walk_addr_of_loan_projections(st_ref, v, direct, true);
                 }
             }
-            Stmt::Assign {
-                targets, values, ..
-            } => {
+            Stmt::Assign { targets, op, values, .. } => {
+                let par = (*op == AssignOp::Assign && targets.len() == values.len())
+                    .then(|| {
+                        let names = targets.iter().map(|t| match &t.kind {
+                            PlaceKind::Ident(n) => n.as_str(),
+                            _ => "_",
+                        });
+                        self.with_parallel_slot_loans(st, names, values)
+                    })
+                    .flatten();
+                let (st_ref, direct) = (par.as_ref().unwrap_or(st), include_direct_ident || par.is_some());
                 for t in targets {
-                    self.check_place_addr_of_loan_projections(st, t, include_direct_ident);
+                    self.check_place_addr_of_loan_projections(st_ref, t, direct);
                 }
                 for v in values {
                     // `x = &m[k]` is the slot-loan re-binding: legal.
-                    self.walk_addr_of_loan_projections(st, v, include_direct_ident, true);
+                    self.walk_addr_of_loan_projections(st_ref, v, direct, true);
                 }
             }
             Stmt::Expr { expr, .. } => {
@@ -334,14 +361,13 @@ impl<'a> Checker<'a> {
                         self.emit_addr_of_loan_diag(name, *id_span);
                     }
                 }
-                Expr::Field { .. } => {
-                    if let Some(root) = operand.root_ident() {
+                other => {
+                    if let Some(root) = self.projection_root_ident(st, other) {
                         if self.lookup_binding(st, root).is_some_and(|b| b.slot_loan) {
                             self.emit_addr_of_loan_diag(root, *span);
                         }
                     }
                 }
-                _ => {}
             }
         }
         match expr {
@@ -378,6 +404,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Call { callee, args, .. } => {
+                self.check_call_auto_addr_of_loan(st, callee, args);
                 self.check_expr_addr_of_loan_projections(st, callee, include_direct_ident);
                 for a in args {
                     self.check_expr_addr_of_loan_projections(st, &a.value, include_direct_ident);
@@ -417,11 +444,72 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn with_parallel_slot_loans<'s>(&self, st: &'s FnState, names: impl Iterator<Item = &'s str>, values: &'s [Expr]) -> Option<FnState> {
+        if values.len() <= 1 || !values.iter().any(|v| self.is_slot_loan_value(st, v)) {
+            return None;
+        }
+        let mut next = st.clone();
+        for (name, val) in names.zip(values.iter()) {
+            if self.is_slot_loan_value(&next, val) {
+                if next.env_lookup_mut(name).is_none() {
+                    let shape = self.shape_of_expr(&next, val);
+                    self.define_binding(&mut next, name, shape, None, false, false, false);
+                }
+                if let Some(b) = next.env_lookup_mut(name) {
+                    b.slot_loan = true;
+                }
+            }
+        }
+        Some(next)
+    }
+
+    fn projection_root_ident<'e>(&self, st: &FnState, expr: &'e Expr) -> Option<&'e str> {
+        let mut cur = unwrap_parens(expr);
+        if !matches!(cur, Expr::Field { .. } | Expr::Index { .. }) {
+            return None;
+        }
+        loop {
+            match unwrap_parens(cur) {
+                Expr::Ident { name, .. } => return Some(name.as_str()),
+                Expr::Field { base, .. } => cur = base,
+                Expr::Index { base, .. } => match self.shape_of_expr(st, base) {
+                    TypeShape::Map(..) => return None,
+                    TypeShape::Pointer(p) if matches!(*p, TypeShape::Map(..)) => return None,
+                    _ => cur = base,
+                },
+                _ => return None,
+            }
+        }
+    }
+
+    fn check_call_auto_addr_of_loan(&mut self, st: &FnState, callee: &Expr, args: &[hy_syntax::CallArg]) {
+        let Expr::Ident { name, .. } = unwrap_parens(callee) else { return };
+        if self.lookup_binding(st, name).is_some() {
+            return;
+        }
+        let head = Self::base_named_type_str(name);
+        let Some(f) = self.fns.get(name).or_else(|| self.fns.get(head)) else { return };
+        for (p, a) in f.params.iter().zip(args.iter()) {
+            if matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. })
+                && !matches!(self.shape_of_expr(st, &a.value), TypeShape::Pointer(_))
+            {
+                if let Some(root) = self.projection_root_ident(st, &a.value) {
+                    if self.lookup_binding(st, root).is_some_and(|b| b.slot_loan) {
+                        self.emit_addr_of_loan_diag(root, a.value.span());
+                    }
+                }
+            }
+        }
+    }
+
     fn emit_addr_of_loan_diag(&mut self, name: &str, span: Span) {
         let msg = format!(
             "`&{}` takes the address of a loan: a map-slot loan is not an addressable value (T24)",
             name
         );
+        if self.diags.iter().any(|d| d.code == "HYB-E3104" && d.span.end == span.end && d.message == msg) {
+            return;
+        }
         let mut d = Diagnostic::error("HYB-E3104", self.path.clone(), span, msg).with_notes(vec![
             format!(
                 "`{}` is already the only general-value `&` Hybrid has (an O8 map-slot loan); a pointer to it would be a general pointer, which Tier 0 does not have",
