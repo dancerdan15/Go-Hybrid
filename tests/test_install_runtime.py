@@ -7,6 +7,7 @@ access, toolchain download, account, or third-party Python package is required.
 """
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,17 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SHELL = shutil.which("sh")
+if os.name == "nt":
+    _git_bash = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+    SHELL = str(_git_bash) if _git_bash.exists() else None
+
+
+def shell_path(path):
+    path = Path(path).resolve()
+    if os.name == "nt":
+        return "/" + path.drive[0].lower() + path.as_posix()[2:]
+    return str(path)
 INSTALL_PATH_NAMES = (
     "ordinary",
     "with spaces",
@@ -264,6 +276,132 @@ class LauncherRuntimeTests(unittest.TestCase):
         for bad in ("../evil", "-rf", "..", "v1/2"):
             r = subprocess.run(["sh", str(ROOT / "install.sh")], env={**os.environ, "HYB_VERSION": bad}, capture_output=True, text=True, timeout=5)
             self.assertEqual(r.returncode, 2)
+
+
+@unittest.skipUnless(SHELL, "requires a POSIX shell (Git Bash works on Windows)")
+class RelativePathShellTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="relpath-test-", dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        shims = self.root / "offline-tools"
+        shims.mkdir()
+        self.asset = "hybrid-v0.0.0-test-linux-amd64.tar.gz"
+        archive_path = self.root / self.asset
+        payload_hyb = (
+            b'#!/bin/sh\n'
+            b'[ "${1:-}" = "explain" ] && [ "${2:-}" = "E0002" ] && exit 0\n'
+            b'printf "RUNTIME=%s\\nEXEC=%s\\nARGS=%s\\n" "${HYB_RUNTIME_DIR:-}" "$0" "$*"\n'
+        )
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for name, contents, mode in (
+                ("hyb", payload_hyb, 0o755),
+                ("runtime/fixture.txt", b"offline runtime\n", 0o644),
+            ):
+                info = tarfile.TarInfo("hybrid-v0.0.0-test/" + name)
+                info.size, info.mode = len(contents), mode
+                archive.addfile(info, io.BytesIO(contents))
+        digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        checksum = self.root / (self.asset + ".sha256")
+        checksum.write_text(f"{digest}  {self.asset}\n", encoding="utf-8", newline="\n")
+        (shims / "uname").write_text(
+            '#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo x86_64;; *) exit 2;; esac\n',
+            encoding="utf-8", newline="\n",
+        )
+        (shims / "curl").write_text(
+            '#!/bin/sh\n'
+            '[ "$#" -eq 4 ] && [ "$1" = "-fsSL" ] && [ "$3" = "-o" ] || exit 2\n'
+            'prefix="https://github.com/limitlessprojects/Go-Hybrid/releases/download/v0.0.0-test/"\n'
+            'case "$2" in\n'
+            '  "${prefix}${HYB_TEST_ASSET}") cp "$HYB_TEST_ARCHIVE" "$4";;\n'
+            '  "${prefix}${HYB_TEST_ASSET}.sha256") cp "$HYB_TEST_CHECKSUM" "$4";;\n'
+            '  *) exit 2;;\n'
+            'esac\n',
+            encoding="utf-8", newline="\n",
+        )
+        for shim in shims.iterdir():
+            shim.chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("HYB_")}
+        self.env.update({
+            "HYB_VERSION": "v0.0.0-test",
+            "HYB_TEST_INSTALLER": shell_path(ROOT / "install.sh"),
+            "HYB_TEST_SHIMS": shell_path(shims),
+            "HYB_TEST_ARCHIVE": shell_path(archive_path),
+            "HYB_TEST_CHECKSUM": shell_path(checksum),
+            "HYB_TEST_ASSET": self.asset,
+            "HYB_TEST_CWD": shell_path(self.root),
+        })
+
+    def run_shell(self, script, **overrides):
+        return subprocess.run(
+            [SHELL, "-c", script],
+            env={**self.env, **overrides},
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+
+    def test_issue_840_relative_bin_and_install_matrix(self):
+        matrix = json.loads((ROOT / "tests/issue_840_relative_bin_dir_matrix.json").read_text(encoding="utf-8"))
+        (self.root / "nested/sub").mkdir(parents=True, exist_ok=True)
+        root_sh = shell_path(self.root)
+        for case in matrix["install_cases"]:
+            with self.subTest(case=case["id"]):
+                invoke_dir = self.root / case["invoke_cwd"]
+                invoke_dir.mkdir(parents=True, exist_ok=True)
+                res = self.run_shell(
+                    'cd "$HYB_TEST_CWD" && PATH="$HYB_TEST_SHIMS:$PATH" sh "$HYB_TEST_INSTALLER"',
+                    HYB_INSTALL_DIR=case["install_dir"], HYB_BIN_DIR=case["bin_dir"],
+                )
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                exp_inst = root_sh + case["expected_install_suffix"]
+                exp_bin = root_sh + case["expected_bin_suffix"]
+                self.assertIn(f"==> installed: {exp_bin}/hyb  (runtime at {exp_inst}/runtime)", res.stdout)
+                self.assertIn(f'export PATH="{exp_bin}:$PATH"', res.stdout)
+                probe = self.run_shell(
+                    'cd "$HYB_INVOKE_CWD" && PATH="$HYB_EXP_BIN:$PATH" hyb build app.hy',
+                    HYB_INVOKE_CWD=shell_path(invoke_dir), HYB_EXP_BIN=exp_bin,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+                lines = dict(line.split("=", 1) for line in probe.stdout.strip().splitlines())
+                self.assertEqual(lines["RUNTIME"], f"{exp_inst}/runtime")
+                self.assertEqual(lines["EXEC"], f"{exp_inst}/bin/hyb")
+                self.assertEqual(lines["ARGS"], "build app.hy")
+
+        alias = matrix["alias_reject_case"]
+        (self.root / "alias-inst/nested").mkdir(parents=True, exist_ok=True)
+        bad = self.run_shell(
+            'cd "$HYB_TEST_CWD" && PATH="$HYB_TEST_SHIMS:$PATH" sh "$HYB_TEST_INSTALLER"',
+            HYB_INSTALL_DIR=alias["install_dir"], HYB_BIN_DIR=alias["bin_dir"],
+        )
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn(alias["expected_error"], bad.stderr)
+
+    def test_issue_840_relative_runtime_install_dir_override_matrix(self):
+        matrix = json.loads((ROOT / "tests/issue_840_relative_install_dir_override.json").read_text(encoding="utf-8"))
+        res = self.run_shell(
+            'cd "$HYB_TEST_CWD" && PATH="$HYB_TEST_SHIMS:$PATH" sh "$HYB_TEST_INSTALLER"',
+            HYB_INSTALL_DIR="base-install", HYB_BIN_DIR="base-bin",
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        shutil.copytree(self.root / "base-install", self.root / "workspace/relocated-hybrid")
+        (self.root / "workspace/sub").mkdir(parents=True, exist_ok=True)
+        launcher = shell_path(self.root / "base-bin/hyb")
+        root_sh = shell_path(self.root)
+        for case in matrix["runtime_override_cases"]:
+            with self.subTest(case=case["id"]):
+                overrides = {
+                    "HYB_CALLER_CWD": shell_path(self.root / case["caller_cwd"]),
+                    "HYB_LAUNCHER": launcher,
+                    "HYB_INSTALL_DIR": case["hyb_install_dir"],
+                }
+                if "hyb_runtime_dir" in case:
+                    overrides["HYB_RUNTIME_DIR"] = case["hyb_runtime_dir"]
+                probe = self.run_shell('cd "$HYB_CALLER_CWD" && "$HYB_LAUNCHER" check demo.hy', **overrides)
+                self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+                lines = dict(line.split("=", 1) for line in probe.stdout.strip().splitlines())
+                self.assertTrue(lines["RUNTIME"].startswith("/"), lines["RUNTIME"])
+                expected = case.get("expected_runtime_exact") or (root_sh + case["expected_runtime_suffix"])
+                self.assertEqual(lines["RUNTIME"], expected)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

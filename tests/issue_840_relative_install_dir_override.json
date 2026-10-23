@@ -1,0 +1,8 @@
+{
+  "issue": 840,
+  "runtime_override_cases": [
+    {"id": "relative_override_from_parent_cwd", "caller_cwd": "workspace", "hyb_install_dir": "relocated-hybrid", "expected_runtime_suffix": "/workspace/relocated-hybrid/runtime"},
+    {"id": "dot_slash_override_from_nested_cwd", "caller_cwd": "workspace/sub", "hyb_install_dir": "../relocated-hybrid", "expected_runtime_suffix": "/workspace/sub/../relocated-hybrid/runtime"},
+    {"id": "explicit_runtime_wins_over_relative_install_override", "caller_cwd": "workspace", "hyb_install_dir": "relocated-hybrid", "hyb_runtime_dir": "/custom/explicit/runtime", "expected_runtime_exact": "/custom/explicit/runtime"}
+  ]
+}

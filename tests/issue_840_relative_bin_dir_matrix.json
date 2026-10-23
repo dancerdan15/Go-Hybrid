@@ -1,0 +1,9 @@
+{
+  "issue": 840,
+  "install_cases": [
+    {"id": "simple_relative_both", "install_dir": "rel-hybrid", "bin_dir": "rel-bin", "expected_install_suffix": "/rel-hybrid", "expected_bin_suffix": "/rel-bin", "invoke_cwd": "other-cwd"},
+    {"id": "dot_and_dotdot_segments", "install_dir": "./nested/sub/../rel-hybrid-dots", "bin_dir": "./nested/./sub/../rel-bin-dots", "expected_install_suffix": "/nested/rel-hybrid-dots", "expected_bin_suffix": "/nested/rel-bin-dots", "invoke_cwd": "deep/caller/cwd"},
+    {"id": "spaces_and_shell_metachars", "install_dir": "./rel space $var 'quote'", "bin_dir": "./bin space $var 'quote'", "expected_install_suffix": "/rel space $var 'quote'", "expected_bin_suffix": "/bin space $var 'quote'", "invoke_cwd": "other-cwd"}
+  ],
+  "alias_reject_case": {"install_dir": "./alias-inst", "bin_dir": "./alias-inst/nested/../bin", "expected_error": "HYB_BIN_DIR must differ from HYB_INSTALL_DIR/bin"}
+}

@@ -22,10 +22,14 @@ REPO="limitlessprojects/Go-Hybrid"
 VERSION="${HYB_VERSION:-}"           # pin a version, else latest
 INSTALL_DIR="${HYB_INSTALL_DIR:-$HOME/.hybrid}"
 BIN_DIR="${HYB_BIN_DIR:-$HOME/.local/bin}"
-# The launcher must keep finding this installation after the caller changes cwd.
+# The launcher and the suggested PATH must still work after the caller changes cwd.
 case "$INSTALL_DIR" in
     /*) ;;
     *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;;
+esac
+case "$BIN_DIR" in
+    /*) ;;
+    *) BIN_DIR="$PWD/$BIN_DIR" ;;
 esac
 
 # --- platform ---
@@ -137,6 +141,16 @@ if [ "$PAYLOAD_BIN" = "$LAUNCHER_BIN" ]; then
     echo "install.sh: HYB_BIN_DIR must differ from HYB_INSTALL_DIR/bin; existing installation preserved" >&2
     exit 1
 fi
+case "$INSTALL_DIR" in
+    *'
+') INSTALL_DIR="${PAYLOAD_BIN%/bin}" ;;
+    *) INSTALL_DIR="$(CDPATH= cd -P "$INSTALL_DIR" && pwd -P)" ;;
+esac
+case "$BIN_DIR" in
+    *'
+') ;;
+    *) BIN_DIR="$LAUNCHER_BIN" ;;
+esac
 rm -rf "$INSTALL_DIR/runtime" "$INSTALL_DIR/bin"
 cp -R "$TMP/hybrid-${TAG}/runtime" "$INSTALL_DIR/runtime"
 mkdir -p "$INSTALL_DIR/bin"
@@ -157,6 +171,10 @@ cat > "$BIN_DIR/hyb" <<LAUNCH
 # Hybrid launcher (installed by install.sh) — wires the packaged runtime.
 HYB_HOME=$(shell_quote "$INSTALL_DIR")
 [ -n "\${HYB_INSTALL_DIR:-}" ] && HYB_HOME="\$HYB_INSTALL_DIR"
+case "\$HYB_HOME" in
+    /*) ;;
+    *) HYB_HOME="\$PWD/\$HYB_HOME" ;;
+esac
 export HYB_RUNTIME_DIR="\${HYB_RUNTIME_DIR:-\$HYB_HOME/runtime}"
 exec "\$HYB_HOME/bin/hyb" "\$@"
 LAUNCH
