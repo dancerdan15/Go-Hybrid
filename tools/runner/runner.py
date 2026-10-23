@@ -36,6 +36,7 @@ Stdlib only — must run on a bare Kaggle/Actions image with just python3.
 import argparse
 import datetime
 import json
+import math
 import os
 import platform
 import shutil
@@ -51,8 +52,18 @@ def run_cmd(cmd, timeout, cwd=None, env=None):
     start = time.monotonic()
     out_tail = ""
     try:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("invalid timeout: {!r}".format(timeout))
+        if isinstance(cmd, list):
+            if not cmd or not all(isinstance(arg, str) for arg in cmd):
+                raise TypeError("invalid command list: {!r}".format(cmd))
+            argv = cmd
+        elif isinstance(cmd, str):
+            argv = ["/bin/sh", "-c", cmd]
+        else:
+            raise TypeError("invalid command: {!r}".format(cmd))
         p = subprocess.run(
-            cmd if isinstance(cmd, list) else ["/bin/sh", "-c", cmd],
+            argv,
             cwd=cwd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=timeout,
@@ -107,13 +118,32 @@ def env_report():
 # Lesson 2026-10-12: Kaggle embeds ephemeral session JWTs (KAGGLE_DATA_PROXY_TOKEN,
 # KAGGLE_USER_SECRETS_TOKEN) in kernel env; they leaked into committed summaries once.
 _SECRET_KEY = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "_KEY", "API_KEY", "PAT")
+_SECRET_VALUE_PREFIXES = ("ghp_", "gho_", "ghs_", "ghr_", "github_pat_", "KGAT_")
+
+
+def _is_secret_key(k: str) -> bool:
+    ku = str(k).upper()
+    segments = ku.replace("-", "_").split("_")
+    for s in _SECRET_KEY:
+        if s == "PAT":
+            if "PAT" in segments:
+                return True
+        elif s in ku:
+            return True
+    return False
+
+
+def _is_secret_value(v) -> bool:
+    return isinstance(v, str) and any(p in v for p in _SECRET_VALUE_PREFIXES)
 
 
 def redact(env: dict) -> dict:
+    if not isinstance(env, dict):
+        return {}
     out = {}
     for k, v in env.items():
-        if any(s in k.upper() for s in _SECRET_KEY):
-            out[k] = "[REDACTED len={}]".format(len(v)) if v else "[EMPTY]"
+        if _is_secret_key(k) or _is_secret_value(v):
+            out[k] = "[REDACTED len={}]".format(len(str(v))) if v else "[EMPTY]"
         else:
             out[k] = v
     return out
@@ -198,39 +228,45 @@ def main():
     sha_ok = True
     unverifiable_pin = False
     want = job.get("sha")
-    # Linked worktrees and submodules use a .git file, not a directory.
-    # Even a broken metadata link or corrupt .git directory inside an ancestor
-    # git repository must enter the fail-closed SHA check without walking up to
-    # an enclosing parent repository.
-    if os.path.lexists(os.path.join(repo_dir, ".git")):
-        sha_env = dict(os.environ, GIT_CEILING_DIRECTORIES=os.path.dirname(repo_dir))
-        code, _, out = run_cmd(["git", "rev-parse", "HEAD"], 10, cwd=repo_dir, env=sha_env)
-        at = out.strip()
-        if code != 0:
-            sha_ok = False
-            record("sha-check", "check", 1, 0.0, "failed to resolve HEAD: {}".format(out.strip()))
-        elif want in (None, "HEAD", ""):
-            record("sha-check", "check", 0, 0.0, "job pins HEAD; at {}".format(at[:12]))
-        elif at != want:
-            # shallow clones of a SHA may differ if fetch fell back to a branch; log loudly
-            sha_ok = False
-            record("sha-check", "check", 1, 0.0, "repo at {} but job pins {}".format(at, want))
-        else:
-            record("sha-check", "check", 0, 0.0, "at {}".format(at))
-    elif want not in (None, "HEAD", ""):
-        # A pinned job against a checkout with no .git (e.g. the Kaggle worker's
-        # codeload-tarball fallback): there is nothing to verify the pin against,
-        # so the job must not run or report ok. Reporting green here would make
-        # summary.json evidence for a commit that was never checked out.
+    if want is not None and not isinstance(want, str):
         sha_ok = False
-        unverifiable_pin = True
-        record(
-            "sha-check",
-            "check",
-            1,
-            0.0,
-            "no .git in {}; cannot verify pinned sha {}".format(repo_dir, str(want)[:12]),
-        )
+        record("sha-check", "check", 1, 0.0, "'sha' must be a string, got {}".format(type(want).__name__))
+    else:
+        want_norm = want.strip() if isinstance(want, str) else ""
+        is_head_pin = want is None or want_norm == "" or want_norm.upper() == "HEAD"
+        # Linked worktrees and submodules use a .git file, not a directory.
+        # Even a broken metadata link or corrupt .git directory inside an ancestor
+        # git repository must enter the fail-closed SHA check without walking up to
+        # an enclosing parent repository.
+        if os.path.lexists(os.path.join(repo_dir, ".git")):
+            sha_env = dict(os.environ, GIT_CEILING_DIRECTORIES=os.path.dirname(repo_dir))
+            code, _, out = run_cmd(["git", "rev-parse", "HEAD"], 10, cwd=repo_dir, env=sha_env)
+            at = out.strip().lower()
+            if code != 0:
+                sha_ok = False
+                record("sha-check", "check", 1, 0.0, "failed to resolve HEAD: {}".format(out.strip()))
+            elif is_head_pin:
+                record("sha-check", "check", 0, 0.0, "job pins HEAD; at {}".format(at[:12]))
+            elif at != want_norm.lower():
+                # shallow clones of a SHA may differ if fetch fell back to a branch; log loudly
+                sha_ok = False
+                record("sha-check", "check", 1, 0.0, "repo at {} but job pins {}".format(at, want_norm))
+            else:
+                record("sha-check", "check", 0, 0.0, "at {}".format(at))
+        elif not is_head_pin:
+            # A pinned job against a checkout with no .git (e.g. the Kaggle worker's
+            # codeload-tarball fallback): there is nothing to verify the pin against,
+            # so the job must not run or report ok. Reporting green here would make
+            # summary.json evidence for a commit that was never checked out.
+            sha_ok = False
+            unverifiable_pin = True
+            record(
+                "sha-check",
+                "check",
+                1,
+                0.0,
+                "no .git in {}; cannot verify pinned sha {}".format(repo_dir, want_norm[:12]),
+            )
 
     hard_setup_failed = False
     if not sha_ok:
@@ -244,9 +280,9 @@ def main():
         for idx, step in enumerate(setup_raw):
             if not isinstance(step, dict):
                 record("setup-{}".format(idx), "setup", 1, 0.0, "step must be an object, got {}".format(type(step).__name__))
-                hard_setup_failed = True
-                break
-            name = step.get("name") or "setup-{}".format(idx)
+                continue
+            raw_name = step.get("name")
+            name = raw_name if isinstance(raw_name, str) and raw_name.strip() else "setup-{}".format(idx)
             cmd = step.get("run")
             if not cmd:
                 record(name, "setup", 1, 0.0, "step missing required 'run' command")
@@ -265,8 +301,9 @@ def main():
     for idx, step in enumerate(commands):
         if not isinstance(step, dict):
             record("cmd-{}".format(idx), "cmd", 1, 0.0, "command step must be an object, got {}".format(type(step).__name__))
-            break
-        name = step.get("name") or "cmd-{}".format(idx)
+            continue
+        raw_name = step.get("name")
+        name = raw_name if isinstance(raw_name, str) and raw_name.strip() else "cmd-{}".format(idx)
         cmd = step.get("run")
         if not cmd:
             record(name, "cmd", 1, 0.0, "command step missing required 'run' command")

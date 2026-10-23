@@ -1,0 +1,48 @@
+{
+  "non_dict_command_fail_soft": {
+    "setup": [],
+    "commands": [
+      "not-a-dict-step",
+      42,
+      {"name": "survivor", "code": "print('survived')", "hard": false, "timeout": 10}
+    ],
+    "expected_code": 1,
+    "expected_ok": false,
+    "expected_steps": [
+      ["cmd-0", 1],
+      ["cmd-1", 1],
+      ["survivor", 0]
+    ]
+  },
+  "non_dict_setup_fail_soft": {
+    "setup": [
+      "bad-setup-entry",
+      {"name": "good-setup", "code": "print('setup-ok')", "hard": false, "timeout": 10}
+    ],
+    "commands": [
+      {"name": "cmd-after-soft-setup", "code": "print('cmd-ok')", "hard": false, "timeout": 10}
+    ],
+    "expected_code": 1,
+    "expected_ok": false,
+    "expected_steps": [
+      ["setup-0", 1],
+      ["good-setup", 0],
+      ["cmd-after-soft-setup", 0]
+    ]
+  },
+  "invalid_timeouts": [
+    true,
+    false,
+    0,
+    -5,
+    null,
+    "invalid",
+    {"seconds": 1}
+  ],
+  "invalid_sha_values": [
+    12345,
+    true,
+    ["HEAD"],
+    {"sha": "HEAD"}
+  ]
+}

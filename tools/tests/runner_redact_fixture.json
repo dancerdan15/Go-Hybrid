@@ -1,0 +1,34 @@
+{
+  "preserve_non_secret_paths": {
+    "GITHUB_PATH": "/home/runner/work/_temp/_runner_file_commands/add_path_1",
+    "GITHUB_EVENT_PATH": "/home/runner/work/_temp/_github_workflow/event.json",
+    "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib",
+    "PYTHONPATH": "/workspace/tools",
+    "GOPATH": "/home/runner/go",
+    "KAGGLE_DATASET_PATH": "/kaggle/input",
+    "KAGGLE_WORKING_PATH": "/kaggle/working",
+    "GITHUB_DISPATCH_TYPE": "ci-smoke"
+  },
+  "redact_by_key": {
+    "PAT": "secret-pat-val",
+    "GITHUB_PAT": "secret-gh-pat",
+    "MY_PAT_VALUE": "nested-pat-val",
+    "GH-PAT": "hyphen-pat-val",
+    "KAGGLE_DATA_PROXY_TOKEN": "session-jwt",
+    "KAGGLE_USER_SECRETS_TOKEN": "user-secret-jwt",
+    "GITHUB_API_KEY": "api-key-val",
+    "RUNNER_SECRET_VAL": "runner-secret",
+    "CI_PASSWORD": "pw-value",
+    "CI_CREDENTIAL": "cred-value",
+    "EMPTY_PAT": ""
+  },
+  "redact_by_value_prefix": {
+    "GITHUB_ACTOR_AUTH": "ghp_short1234",
+    "GITHUB_OAUTH_VAL": "gho_short1234",
+    "GITHUB_SERVER_VAL": "ghs_short1234",
+    "GITHUB_REFRESH_VAL": "ghr_short1234",
+    "CI_FINE_GRAINED": "github_pat_short1234",
+    "KAGGLE_CLI_AUTH": "KGAT_short1234",
+    "CI_HEADER": "Authorization: Bearer ghp_short5678"
+  }
+}

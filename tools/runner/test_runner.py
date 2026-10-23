@@ -276,7 +276,7 @@ class RunnerOutputTests(unittest.TestCase):
                 code, _, tail = runner.run_cmd(
                     [sys.executable, '-c', 'print("completed"); raise SystemExit(%d)' % expected], 10)
                 self.assertEqual(code, expected)
-                self.assertEqual(tail, 'completed\n')
+                self.assertEqual(tail.replace('\r\n', '\n'), 'completed\n')
 
     def test_job_summary_keeps_timeout_diagnostic(self):
         code, summary = RunnerFailureTests.run_job(self, [], [step(
@@ -306,11 +306,13 @@ class WorktreeShaTests(unittest.TestCase):
                                           'rev-parse', 'HEAD'], text=True).strip()
             self.assertTrue((worktree / '.git').is_file())
             if broken:
+                (worktree / '.git').unlink()
                 (worktree / '.git').write_text('gitdir: missing-metadata\n', encoding='utf-8')
             setup_marker, command_marker = root / 'setup.ran', root / 'command.ran'
             job_path, results = root / 'job.json', root / 'results'
+            resolved_pin = at if pin == 'exact' else (f'  {at.upper()}  ' if pin == 'exact-upper' else pin)
             job_path.write_text(json.dumps({
-                'job': 'worktree-pin', 'sha': at if pin == 'exact' else pin,
+                'job': 'worktree-pin', 'sha': resolved_pin,
                 'setup': [step('setup', f'from pathlib import Path; Path({str(setup_marker)!r}).touch()')],
                 'commands': [step('command', f'from pathlib import Path; Path({str(command_marker)!r}).touch()')],
             }), encoding='utf-8')
@@ -333,7 +335,7 @@ class WorktreeShaTests(unittest.TestCase):
         self.assertEqual([(s['name'], s['exit']) for s in summary['steps']], [('sha-check', 1)])
 
     def test_matching_worktree_sha_and_head_run_both_phases(self):
-        for pin in ('exact', 'HEAD'):
+        for pin in ('exact', 'exact-upper', 'HEAD', '  head  '):
             with self.subTest(pin=pin):
                 code, summary, setup_ran, command_ran = self.run_worktree_job(pin)
                 self.assertEqual(code, 0)
@@ -349,6 +351,73 @@ class WorktreeShaTests(unittest.TestCase):
         self.assertFalse(setup_ran)
         self.assertFalse(command_ran)
         self.assertIn('failed to resolve HEAD', summary['steps'][0]['out_tail'])
+
+
+class RunnerRedactAndContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tests_dir = pathlib.Path(__file__).resolve().parent.parent / 'tests'
+        cls.redact_fixture = json.loads((tests_dir / 'runner_redact_fixture.json').read_text(encoding='utf-8'))
+        cls.contract_cases = json.loads((tests_dir / 'runner_contract_cases.json').read_text(encoding='utf-8'))
+
+    def _materialize_steps(self, entries):
+        out = []
+        for item in entries:
+            if isinstance(item, dict) and 'code' in item:
+                out.append(step(item['name'], item['code'], item.get('hard', False), item.get('timeout', 10)))
+            else:
+                out.append(item)
+        return out
+
+    def test_redact_preserves_github_path_and_masks_secret_keys_and_values(self):
+        preserved = runner.redact(self.redact_fixture['preserve_non_secret_paths'])
+        self.assertEqual(preserved, self.redact_fixture['preserve_non_secret_paths'])
+
+        by_key = runner.redact(self.redact_fixture['redact_by_key'])
+        for k, raw in self.redact_fixture['redact_by_key'].items():
+            with self.subTest(key=k):
+                expected = f'[REDACTED len={len(raw)}]' if raw else '[EMPTY]'
+                self.assertEqual(by_key[k], expected)
+
+        by_val = runner.redact(self.redact_fixture['redact_by_value_prefix'])
+        for k, raw in self.redact_fixture['redact_by_value_prefix'].items():
+            with self.subTest(value_key=k):
+                self.assertEqual(by_val[k], f'[REDACTED len={len(raw)}]')
+
+        self.assertEqual(runner.redact(None), {})
+
+    def test_non_dict_steps_respect_fail_soft_contract(self):
+        for case_name in ('non_dict_command_fail_soft', 'non_dict_setup_fail_soft'):
+            case = self.contract_cases[case_name]
+            with self.subTest(case=case_name):
+                code, summary = RunnerFailureTests().run_job(
+                    self._materialize_steps(case['setup']),
+                    self._materialize_steps(case['commands']),
+                )
+                self.assertEqual(code, case['expected_code'])
+                self.assertEqual(summary['ok'], case['expected_ok'])
+                self.assertEqual(
+                    [[s['name'], s['exit']] for s in summary['steps']],
+                    case['expected_steps'],
+                )
+
+    def test_invalid_timeout_values_rejected_across_contract_cases(self):
+        for bad_timeout in self.contract_cases['invalid_timeouts'] + [float('nan'), float('inf'), float('-inf')]:
+            with self.subTest(timeout=bad_timeout):
+                code, _, tail = runner.run_cmd([sys.executable, '-c', 'pass'], bad_timeout)
+                self.assertEqual(code, 125)
+                self.assertIn('invalid timeout', tail)
+
+    def test_non_string_sha_values_fail_closed(self):
+        for bad_sha in self.contract_cases['invalid_sha_values']:
+            with self.subTest(sha=bad_sha):
+                code, summary, setup_ran, command_ran = WorktreeShaTests().run_worktree_job(bad_sha)
+                self.assertEqual(code, 1)
+                self.assertFalse(summary['ok'])
+                self.assertFalse(setup_ran)
+                self.assertFalse(command_ran)
+                self.assertEqual([(s['name'], s['exit']) for s in summary['steps']], [('sha-check', 1)])
+                self.assertIn("'sha' must be a string", summary['steps'][0]['out_tail'])
 
 
 if __name__ == '__main__':
