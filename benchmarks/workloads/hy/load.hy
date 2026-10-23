@@ -23,9 +23,13 @@ fn pct(a []int, p int) int {
         }
         sorted[j+1] = v
     }
-    idx := p * len(sorted) / 100
-    if idx >= len(sorted) {
-        idx = len(sorted) - 1
+    n := len(sorted)
+    idx := (p * n + 99) / 100 - 1
+    if idx < 0 {
+        idx = 0
+    }
+    if idx >= n {
+        idx = n - 1
     }
     return sorted[idx]
 }

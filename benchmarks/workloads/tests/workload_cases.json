@@ -1,0 +1,64 @@
+{
+  "formula": "max(0, min(n - 1, (p * n + 99) // 100 - 1))",
+  "invalid_iterations": [0, -1, -100],
+  "invalid_percentiles": [-1, -100, 101, 200],
+  "cases": [
+    {"n": 1, "p": 0, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 1, "p": 50, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 1, "p": 95, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 1, "p": 99, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 1, "p": 100, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 10, "p": 0, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 10, "p": 50, "expected_index": 4, "legacy_buggy_index": 5},
+    {"n": 10, "p": 95, "expected_index": 9, "legacy_buggy_index": 9},
+    {"n": 10, "p": 99, "expected_index": 9, "legacy_buggy_index": 9},
+    {"n": 10, "p": 100, "expected_index": 9, "legacy_buggy_index": 9},
+    {"n": 100, "p": 0, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 100, "p": 50, "expected_index": 49, "legacy_buggy_index": 50},
+    {"n": 100, "p": 95, "expected_index": 94, "legacy_buggy_index": 95},
+    {"n": 100, "p": 99, "expected_index": 98, "legacy_buggy_index": 99},
+    {"n": 100, "p": 100, "expected_index": 99, "legacy_buggy_index": 99},
+    {"n": 1000, "p": 0, "expected_index": 0, "legacy_buggy_index": 0},
+    {"n": 1000, "p": 50, "expected_index": 499, "legacy_buggy_index": 500},
+    {"n": 1000, "p": 95, "expected_index": 949, "legacy_buggy_index": 950},
+    {"n": 1000, "p": 99, "expected_index": 989, "legacy_buggy_index": 990},
+    {"n": 1000, "p": 100, "expected_index": 999, "legacy_buggy_index": 999}
+  ],
+  "csv_schema": {
+    "header": "lang,workload,p50_ns,p99_ns,mean_ns,n",
+    "columns": ["lang", "workload", "p50_ns", "p99_ns", "mean_ns", "n"],
+    "languages": ["go", "rust", "hy"],
+    "workloads": ["alloc", "load"],
+    "sample_outputs": {
+      "go": [
+        "alloc p50=120ns p99=240ns mean=135.5ns n=100",
+        "load p50=163ns p99=210ns mean=170.2ns n=100"
+      ],
+      "rust": [
+        "alloc p50=115ns p99=230ns mean=128.4ns n=100",
+        "load p50=112ns p99=150ns mean=118.0ns n=100"
+      ],
+      "hy": [
+        "load p50=162ns p99=205ns mean=168ns n=100",
+        "alloc p50=125ns p99=245ns mean=138ns n=100"
+      ]
+    },
+    "malformed_lines": [
+      "",
+      "== Go twin ==",
+      "alloc p50=120 p99=240ns mean=135.5ns n=100",
+      "alloc p50=-1ns p99=240ns mean=135.5ns n=100",
+      "unknown p50=120ns p99=240ns mean=135.5ns n=100",
+      "alloc p50=120ns p99=240ns mean=135.5ns n=100 trailing",
+      "alloc p50=120ns p99=240ns mean=.5ns n=100"
+    ],
+    "expected_csv_rows": [
+      "go,alloc,120,240,135.5,100",
+      "go,load,163,210,170.2,100",
+      "rust,alloc,115,230,128.4,100",
+      "rust,load,112,150,118.0,100",
+      "hy,load,162,205,168,100",
+      "hy,alloc,125,245,138,100"
+    ]
+  }
+}

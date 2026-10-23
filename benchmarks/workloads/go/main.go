@@ -37,9 +37,13 @@ func loadOnce(items []string) (tokens int, chars int) {
 }
 
 func pct(sorted []int64, p int) int64 {
-	idx := p * len(sorted) / 100
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
+	n := len(sorted)
+	idx := (p*n + 99)/100 - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
 	}
 	return sorted[idx]
 }

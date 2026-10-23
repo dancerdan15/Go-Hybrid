@@ -19,10 +19,13 @@ cargo, Hybrid via hyb check+build — the checker runs on every .hy workload).
 """
 
 import argparse
+import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
+CSV_HEADER = "lang,workload,p50_ns,p99_ns,mean_ns,n"
 
 # ---------------------------------------------------------------- shape ---
 WINDOWS = 100          # timed windows per workload
@@ -71,9 +74,13 @@ func loadOnce(items []string) (tokens int, chars int) {
 }
 
 func pct(sorted []int64, p int) int64 {
-	idx := p * len(sorted) / 100
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
+	n := len(sorted)
+	idx := (p*n + 99)/100 - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
 	}
 	return sorted[idx]
 }
@@ -135,9 +142,11 @@ fn split_ws(s: &str) -> Vec<&str> {
 }
 
 fn pct(sorted: &[i64], p: usize) -> i64 {
-    let mut idx = p * sorted.len() / 100;
-    if idx >= sorted.len() {
-        idx = sorted.len() - 1;
+    let n = sorted.len();
+    let rank = (p * n + 99) / 100;
+    let mut idx = if rank > 0 { (p * n + 99) / 100 - 1 } else { 0 };
+    if idx >= n {
+        idx = n - 1;
     }
     sorted[idx]
 }
@@ -219,9 +228,13 @@ fn pct(a []int, p int) int {
         }
         sorted[j+1] = v
     }
-    idx := p * len(sorted) / 100
-    if idx >= len(sorted) {
-        idx = len(sorted) - 1
+    n := len(sorted)
+    idx := (p * n + 99) / 100 - 1
+    if idx < 0 {
+        idx = 0
+    }
+    if idx >= n {
+        idx = n - 1
     }
     return sorted[idx]
 }
@@ -291,9 +304,13 @@ fn pct(a []int, p int) int {
         }
         sorted[j+1] = v
     }
-    idx := p * len(sorted) / 100
-    if idx >= len(sorted) {
-        idx = len(sorted) - 1
+    n := len(sorted)
+    idx := (p * n + 99) / 100 - 1
+    if idx < 0 {
+        idx = 0
+    }
+    if idx >= n {
+        idx = n - 1
     }
     return sorted[idx]
 }
@@ -328,6 +345,53 @@ fn main() {
 '''
 
 
+def validate_iterations(iterations: int) -> int:
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+        raise ValueError(f"iterations must be a positive integer (> 0), got {iterations!r}")
+    return iterations
+
+
+def quantile_index(n: int, p: int) -> int:
+    validate_iterations(n)
+    if isinstance(p, bool) or not isinstance(p, int) or p < 0 or p > 100:
+        raise ValueError(f"percentile p must be in 0..100, got {p!r}")
+    idx = (p * n + 99) // 100 - 1
+    if idx < 0:
+        idx = 0
+    if idx >= n:
+        idx = n - 1
+    return idx
+
+
+def pct_value(samples: list[int], p: int) -> int:
+    ordered = sorted(samples)
+    return ordered[quantile_index(len(ordered), p)]
+
+
+WORKLOAD_LINE_RE = re.compile(
+    r"^(alloc|load)\s+p50=(\d+)ns\s+p99=(\d+)ns\s+mean=([0-9]+(?:\.[0-9]+)?)ns\s+n=(\d+)\s*$"
+)
+
+
+def parse_workload_line(lang: str, line: str) -> str | None:
+    m = WORKLOAD_LINE_RE.match(line.strip())
+    if not m:
+        return None
+    workload, p50, p99, mean, n = m.groups()
+    validate_iterations(int(n))
+    return f"{lang},{workload},{p50},{p99},{mean},{n}"
+
+
+def format_csv_rows(outputs_by_lang: dict[str, list[str]]) -> list[str]:
+    rows = [CSV_HEADER]
+    for lang, lines in outputs_by_lang.items():
+        for line in lines:
+            parsed = parse_workload_line(lang, line)
+            if parsed is not None:
+                rows.append(parsed)
+    return rows
+
+
 def go_alphabet():
     return ", ".join(str(b) for b in ALPHABET)
 
@@ -336,9 +400,14 @@ def hy_alphabet():
     return ", ".join(str(b) for b in ALPHABET)
 
 
-def render(tpl: str) -> str:
+def render(tpl: str, windows: int = WINDOWS) -> str:
+    validate_iterations(windows)
+    validate_iterations(LOAD_ITEMS)
+    validate_iterations(ALLOC_BATCHES)
+    validate_iterations(ALLOC_BATCH)
+    validate_iterations(ALLOC_ITEM)
     subs = {
-        "@WINDOWS@": str(WINDOWS),
+        "@WINDOWS@": str(windows),
         "@LOAD_ITEMS@": str(LOAD_ITEMS),
         "@ALLOC_BATCHES@": str(ALLOC_BATCHES),
         "@ALLOC_BATCH@": str(ALLOC_BATCH),
@@ -362,13 +431,123 @@ edition = "2021"
 opt-level = 3
 """
 
-FILES = {
-    "go/main.go": render(GO_TEMPLATE),
-    "rust/src/main.rs": render(RUST_TEMPLATE),
-    "hy/load.hy": render(HY_LOAD_TEMPLATE),
-    "hy/alloc.hy": render(HY_ALLOC_TEMPLATE),
-    "rust/Cargo.toml": RUST_TOML,
-}
+
+def build_files(windows: int = WINDOWS) -> dict[str, str]:
+    return {
+        "go/main.go": render(GO_TEMPLATE, windows=windows),
+        "rust/src/main.rs": render(RUST_TEMPLATE, windows=windows),
+        "hy/load.hy": render(HY_LOAD_TEMPLATE, windows=windows),
+        "hy/alloc.hy": render(HY_ALLOC_TEMPLATE, windows=windows),
+        "rust/Cargo.toml": RUST_TOML,
+    }
+
+
+FILES = build_files(WINDOWS)
+
+
+def run_self_test() -> int:
+    fixture_path = ROOT / "tests" / "workload_cases.json"
+    q_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    c_fixture = q_fixture["csv_schema"]
+
+    for case in q_fixture["cases"]:
+        n, p, expected = case["n"], case["p"], case["expected_index"]
+        got = quantile_index(n, p)
+        if got != expected:
+            raise AssertionError(f"quantile_index({n}, {p}) = {got}, expected {expected}")
+        samples = list(range(1, n + 1))
+        if pct_value(samples, p) != expected + 1:
+            raise AssertionError(f"pct_value(1..{n}, {p}) != {expected + 1}")
+
+    for bad_n in [*q_fixture["invalid_iterations"], True, False]:
+        for fn in (
+            lambda x=bad_n: validate_iterations(x),
+            lambda x=bad_n: quantile_index(x, 99),
+            lambda x=bad_n: render(GO_TEMPLATE, windows=x),
+        ):
+            try:
+                fn()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"expected ValueError for iterations={bad_n!r}")
+
+    for bad_p in [*q_fixture["invalid_percentiles"], True, False]:
+        for fn in (
+            lambda x=bad_p: quantile_index(100, x),
+            lambda x=bad_p: pct_value([10, 20, 30], x),
+        ):
+            try:
+                fn()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"expected ValueError for percentile={bad_p!r}")
+
+    for fn in (
+        lambda: pct_value([], 50),
+        lambda: parse_workload_line("go", "alloc p50=120ns p99=240ns mean=135.5ns n=0"),
+    ):
+        try:
+            fn()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for empty samples / n=0 workload line")
+
+    for bad_line in c_fixture["malformed_lines"]:
+        if parse_workload_line("go", bad_line) is not None:
+            raise AssertionError(f"expected None for malformed line {bad_line!r}")
+
+    if "(p*n + 99)/100 - 1" not in FILES["go/main.go"] or "p * len(sorted) / 100" in FILES["go/main.go"]:
+        raise AssertionError("go/main.go missing nearest-rank formula")
+    for rel in ("rust/src/main.rs", "hy/load.hy", "hy/alloc.hy"):
+        src = FILES[rel]
+        if "(p * n + 99) / 100 - 1" not in src:
+            raise AssertionError(f"{rel} missing nearest-rank formula")
+        if "p * len(sorted) / 100" in src or "p * sorted.len() / 100" in src:
+            raise AssertionError(f"{rel} still contains legacy p * len / 100 formula")
+
+    for rel, content in FILES.items():
+        if "\r\n" in content:
+            raise AssertionError(f"rendered {rel} contains CRLF")
+        disk_path = ROOT / rel
+        if disk_path.is_file() and b"\r\n" in disk_path.read_bytes():
+            raise AssertionError(f"on-disk {rel} contains CRLF")
+
+    for rel in ("hy/load.hy", "hy/alloc.hy"):
+        for line in FILES[rel].splitlines():
+            code = line.split("//", 1)[0]
+            code = re.sub(r'"[^"]*"', '""', code)
+            for ident in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", code):
+                if ident != ident.lower():
+                    raise AssertionError(f"LX2 violation in {rel}: {ident}")
+
+    if c_fixture["header"] != CSV_HEADER or c_fixture["columns"] != CSV_HEADER.split(","):
+        raise AssertionError("CSV header/columns mismatch")
+    noisy_outputs = {
+        lang: [*c_fixture["malformed_lines"], *lines]
+        for lang, lines in c_fixture["sample_outputs"].items()
+    }
+    rows = format_csv_rows(noisy_outputs)
+    expected_rows = [c_fixture["header"], *c_fixture["expected_csv_rows"]]
+    if rows != expected_rows:
+        raise AssertionError(f"CSV rows mismatch: {rows} != {expected_rows}")
+
+    run_sh = ROOT / "run.sh"
+    if run_sh.is_file():
+        sh_src = run_sh.read_text(encoding="utf-8")
+        if CSV_HEADER not in sh_src:
+            raise AssertionError(f"run.sh missing required CSV header: {CSV_HEADER}")
+
+    print(
+        f"self-test OK ({len(q_fixture['cases'])} quantile cases, "
+        f"{len(q_fixture['invalid_iterations'])} invalid iteration checks, "
+        f"{len(q_fixture['invalid_percentiles'])} invalid percentile checks, "
+        f"{len(c_fixture['malformed_lines'])} malformed line checks, "
+        f"{len(c_fixture['expected_csv_rows'])} CSV rows)"
+    )
+    return 0
 
 
 def main() -> int:
@@ -378,17 +557,32 @@ def main() -> int:
     parser.add_argument(
         "--check", action="store_true", help="verify generated files without writing",
     )
-    check = parser.parse_args().check
+    parser.add_argument(
+        "--self-test", action="store_true", help="verify quantile and CSV fixtures",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=WINDOWS, help="window count (> 0)",
+    )
+    args = parser.parse_args()
+    try:
+        validate_iterations(args.iterations)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.self_test:
+        return run_self_test()
+    files = build_files(args.iterations)
     drift = []
-    for rel, content in FILES.items():
+    for rel, content in files.items():
         p = ROOT / rel
-        if check:
+        if args.check:
             if not p.is_file() or p.read_text(encoding="utf-8") != content:
                 drift.append(rel)
         else:
-            p.write_text(content, encoding="utf-8")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8", newline="\n")
             print(f"wrote {rel}")
-    if check:
+    if args.check:
         if drift:
             print("DRIFTED (rerun `python3 shape.py` and commit):", ", ".join(drift))
             return 1
@@ -398,3 +592,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

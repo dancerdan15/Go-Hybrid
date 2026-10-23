@@ -20,9 +20,11 @@ fn split_ws(s: &str) -> Vec<&str> {
 }
 
 fn pct(sorted: &[i64], p: usize) -> i64 {
-    let mut idx = p * sorted.len() / 100;
-    if idx >= sorted.len() {
-        idx = sorted.len() - 1;
+    let n = sorted.len();
+    let rank = (p * n + 99) / 100;
+    let mut idx = if rank > 0 { (p * n + 99) / 100 - 1 } else { 0 };
+    if idx >= n {
+        idx = n - 1;
     }
     sorted[idx]
 }
