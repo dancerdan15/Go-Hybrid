@@ -334,7 +334,7 @@ fn stmt_reads(s: &Stmt, target: &str) -> bool {
                     MatchPattern::Path {
                         segments,
                         binding: Some(b),
-                    } if segments != &["none"] && b == target
+                    } if segments == &["some"] && b == target
                 ) {
                     continue;
                 }

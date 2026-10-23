@@ -40,11 +40,11 @@ fn rangebind_preserves_deep_nested_and_selector_indexed_calls() {
 
 import "fmt"
 
-type config struct {
+struct config {
     slots []int
 }
 
-type table struct {
+struct table {
     fns []fn(int) int
 }
 

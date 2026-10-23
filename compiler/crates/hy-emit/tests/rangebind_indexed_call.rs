@@ -67,9 +67,9 @@ fn rangebind_handles_selector_indexed_callee_without_confusing_field_name() {
 
 import "fmt"
 
-type runner struct {
-    fns []fn(int) int
+struct runner {
     idx int
+    fns []fn(int) int
 }
 
 fn run_all(r runner, items []int) {
